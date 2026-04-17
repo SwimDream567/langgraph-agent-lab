@@ -39,6 +39,13 @@ MINIMAX_API_BASE = os.environ.get("MINIMAX_API_BASE", "https://api.minimaxi.com/
 MINIMAX_CHAT = "MiniMax-M2.7"     # MiniMax 文本对话模型
 
 # ==========================================
+# Ollama 本地模型（兼容 OpenAI 格式）
+# ==========================================
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
+OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4-fast")
+
+# ==========================================
 # Embedding 模型配置
 # ==========================================
 
@@ -57,13 +64,36 @@ HF_EMBED_DIM = 1024  # 输出 1024 维向量，中文语义表达更强
 # EMBEDDING_MODEL = "text-embedding-3-large"  # 3072维
 
 # ==========================================
-# 默认配置（改这里切换模型）
+# 动态模型切换（只改 .env 的 PROVIDER 即可）
 # ==========================================
-# API_KEY = GLM_API_KEY
-# API_BASE = GLM_API_BASE
-# MODEL_FAST = GLM_FAST
-# MODEL_STRONG = GLM_STRONG
-API_KEY = MINIMAX_API_KEY
-API_BASE = MINIMAX_API_BASE
-MODEL_FAST = MINIMAX_CHAT
-MODEL_STRONG = GLM_STRONG
+# .env 里设置 PROVIDER=ollama / glm / minimax
+# 不需要改这个文件！
+
+PROVIDER = os.environ.get("PROVIDER", "ollama").lower()
+
+_providers = {
+    "ollama": {
+        "api_key": OLLAMA_API_KEY,
+        "api_base": OLLAMA_API_BASE,
+        "fast": OLLAMA_MODEL,
+        "strong": OLLAMA_MODEL,
+    },
+    "glm": {
+        "api_key": GLM_API_KEY,
+        "api_base": GLM_API_BASE,
+        "fast": GLM_FAST,
+        "strong": GLM_STRONG,
+    },
+    "minimax": {
+        "api_key": MINIMAX_API_KEY,
+        "api_base": MINIMAX_API_BASE,
+        "fast": MINIMAX_CHAT,
+        "strong": GLM_STRONG,
+    },
+}
+
+_active = _providers.get(PROVIDER, _providers["ollama"])
+API_KEY = _active["api_key"]
+API_BASE = _active["api_base"]
+MODEL_FAST = _active["fast"]
+MODEL_STRONG = _active["strong"]

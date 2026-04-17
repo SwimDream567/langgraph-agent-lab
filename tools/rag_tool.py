@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 import sys; sys.stdout.reconfigure(encoding='utf-8')
 
+# RAG 日志开关：被 chat_agent.py 导入时静默，独立运行时输出
+_QUIET = not sys.argv[0].endswith("rag_tool.py")
+def _log(*args, **kw):
+    if not _QUIET:
+        print(*args, **kw)
+
 """RAG 搜索工具 - 混合检索版（向量 + BM25）
 
 架构：企业级分层设计
@@ -181,24 +187,38 @@ _chunks_meta = []
 
 
 def _get_embedding():
-    """懒加载 Embedding 模型
-
-    网络保护：
-    - HF_ENDPOINT = 国内镜像（hf-mirror.com），快且稳定
-    - HF_HUB_HTTP_TIMEOUT = 60秒，单次请求超时上限
-    - 模型下载到本地缓存后，后续启动不再下载
-    - 如果镜像不可用，抛出异常而非无限等待
-    """
+    """懒加载 Embedding 模型"""
     global _embedding
     if _embedding is None:
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        os.environ["HF_HUB_HTTP_TIMEOUT"] = "60"  # 单次 HTTP 请求 60 秒超时
+        os.environ["HF_HUB_HTTP_TIMEOUT"] = "60"
+
+        # 静默 transformers / sentence_transformers / tqdm 的加载日志
+        import logging
+        import io
+        import contextlib
+        for _n in ("transformers", "transformers.modeling_utils",
+                    "sentence_transformers", "torch", "tqdm"):
+            logging.getLogger(_n).setLevel(logging.ERROR)
+        # 环境变量禁用 tqdm（最可靠，影响所有 tqdm 实例）
+        _old_tqdm = os.environ.get("TQDM_DISABLE")
+        os.environ["TQDM_DISABLE"] = "1"
+
         from langchain_huggingface import HuggingFaceEmbeddings
-        _embedding = HuggingFaceEmbeddings(
-            model_name=HF_EMBED_MODEL,
-            encode_kwargs={"normalize_embeddings": True},
-        )
-        print(f"[RAG] Embedding 模型: {HF_EMBED_MODEL} (HTTP timeout=60s)")
+
+        # stderr 重定向兜底（抓住漏网之鱼）
+        with contextlib.redirect_stderr(io.StringIO()):
+            _embedding = HuggingFaceEmbeddings(
+                model_name=HF_EMBED_MODEL,
+                encode_kwargs={"normalize_embeddings": True},
+            )
+
+        # 恢复 tqdm 环境变量
+        if _old_tqdm is None:
+            os.environ.pop("TQDM_DISABLE", None)
+        else:
+            os.environ["TQDM_DISABLE"] = _old_tqdm
+        _log(f"[RAG] Embedding 模型: {HF_EMBED_MODEL}")
     return _embedding
 
 
@@ -256,7 +276,7 @@ def _save_bm25_index(tokenized_corpus: list, chunks: list):
     }
     with open(BM25_INDEX_FILE, 'w', encoding='utf-8') as f:
         json.dump(index_data, f, ensure_ascii=False)
-    print(f"[RAG] BM25 索引已持久化：{len(tokenized_corpus)} 条 -> {BM25_INDEX_FILE}")
+    _log(f"[RAG] BM25 索引已持久化：{len(tokenized_corpus)} 条 -> {BM25_INDEX_FILE}")
 
 
 def _load_bm25_index():
@@ -274,7 +294,7 @@ def _load_bm25_index():
         chunks_meta = index_data.get("chunks_meta", [])
         return tokenized_corpus, chunks_meta
     except (json.JSONDecodeError, IOError) as e:
-        print(f"[RAG] BM25 索引文件损坏，将重建: {e}")
+        _log(f"[RAG] BM25 索引文件损坏，将重建: {e}")
         return None, None
 
 
@@ -298,7 +318,7 @@ def ingest(kb_path: str = None, force: bool = False):
 
     kb_path = kb_path or DEFAULT_KB_PATH
     if not os.path.exists(kb_path):
-        print(f"[RAG] ❌ 目录不存在: {kb_path}")
+        _log(f"[RAG] ❌ 目录不存在: {kb_path}")
         return
 
     embedding = _get_embedding()
@@ -317,7 +337,7 @@ def ingest(kb_path: str = None, force: bool = False):
             if ext in SUPPORTED_EXTENSIONS:
                 doc_files.append(os.path.join(root, fname))
 
-    print(f"[RAG] 扫描到 {len(doc_files)} 个文件")
+    _log(f"[RAG] 扫描到 {len(doc_files)} 个文件")
 
     # ---- 增量更新检测 ----
     meta = _load_meta()
@@ -340,12 +360,12 @@ def ingest(kb_path: str = None, force: bool = False):
         deleted_paths = stored_paths - current_paths
         if deleted_paths:
             deleted_files = list(deleted_paths)
-            print(f"[RAG] 🗑️ 发现 {len(deleted_files)} 个已删除文件: {deleted_files[:3]}{'...' if len(deleted_files) > 3 else ''}")
+            _log(f"[RAG] 🗑️ 发现 {len(deleted_files)} 个已删除文件: {deleted_files[:3]}{'...' if len(deleted_files) > 3 else ''}")
 
         if not changed_files and not deleted_files and os.path.exists(
             os.path.join(CHROMA_DIR, "chroma.sqlite3")
         ):
-            print(f"[RAG] ✅ 所有文件未变化，跳过入库")
+            _log(f"[RAG] ✅ 所有文件未变化，跳过入库")
             # 仍然需要加载 BM25
             _load_vectorstore_and_bm25(kb_path, embedding)
             return
@@ -359,7 +379,7 @@ def ingest(kb_path: str = None, force: bool = False):
             reason = []
             if changed_files: reason.append(f"{len(changed_files)} 个变化")
             if deleted_files: reason.append(f"{len(deleted_files)} 个删除")
-            print(f"[RAG] 📝 {', '.join(reason)}，需要重建向量库")
+            _log(f"[RAG] 📝 {', '.join(reason)}，需要重建向量库")
             need_rebuild = True
 
     # ---- 加载并切块（通用文件读取） ----
@@ -375,7 +395,7 @@ def ingest(kb_path: str = None, force: bool = False):
             metadata={"source": os.path.relpath(fpath, kb_path), "ext": ext}
         )
         all_docs.append(doc)
-        print(f"  📄 {os.path.relpath(fpath, kb_path)}")
+        _log(f"  📄 {os.path.relpath(fpath, kb_path)}")
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=600,
@@ -384,7 +404,7 @@ def ingest(kb_path: str = None, force: bool = False):
         add_start_index=True,
     )
     chunks = text_splitter.split_documents(all_docs)
-    print(f"[RAG] 切块完成：{len(chunks)} 个块")
+    _log(f"[RAG] 切块完成：{len(chunks)} 个块")
 
     # ---- 存入 ChromaDB ----
     if need_rebuild:
@@ -393,7 +413,7 @@ def ingest(kb_path: str = None, force: bool = False):
             import shutil
             shutil.rmtree(CHROMA_DIR, ignore_errors=True)
 
-        print(f"[RAG] 构建向量库: {CHROMA_DIR}")
+        _log(f"[RAG] 构建向量库: {CHROMA_DIR}")
         _vectorstore = Chroma.from_documents(
             documents=chunks,
             embedding=embedding,
@@ -404,7 +424,7 @@ def ingest(kb_path: str = None, force: bool = False):
         return
 
     count = _vectorstore._collection.count()
-    print(f"[RAG] 向量库就绪：{count} 条向量")
+    _log(f"[RAG] 向量库就绪：{count} 条向量")
 
     # ---- BM25 索引 ----
     tokenized_corpus = [_tokenize_zh(doc.page_content) for doc in chunks]
@@ -413,7 +433,7 @@ def ingest(kb_path: str = None, force: bool = False):
         {"source": doc.metadata.get("source", ""), "start_index": doc.metadata.get("start_index", 0), "page_content": doc.page_content}
         for doc in chunks
     ]
-    print(f"[RAG] BM25 就绪：{len(chunks)} 篇文档")
+    _log(f"[RAG] BM25 就绪：{len(chunks)} 篇文档")
 
     # 持久化 BM25 分词结果，下次启动直接加载，不用重新分词
     _save_bm25_index(tokenized_corpus, chunks)
@@ -431,7 +451,7 @@ def ingest(kb_path: str = None, force: bool = False):
     # meta 里残留的已删除文件路径会在下次入库时被 deleted_paths 检测到并触发重建
     # 这里不需要手动删（need_rebuild=True 时整个 CHROMA_DIR 会被清空）
     _save_meta(meta)
-    print(f"[RAG] ✅ 入库完成，元数据已保存")
+    _log(f"[RAG] ✅ 入库完成，元数据已保存")
 
 
 def _load_vectorstore_and_bm25(kb_path, embedding):
@@ -446,7 +466,7 @@ def _load_vectorstore_and_bm25(kb_path, embedding):
     from langchain_chroma import Chroma
     from rank_bm25 import BM25Okapi
 
-    print(f"[RAG] 加载已有向量库: {CHROMA_DIR}")
+    _log(f"[RAG] 加载已有向量库: {CHROMA_DIR}")
     _vectorstore = Chroma(
         persist_directory=CHROMA_DIR,
         embedding_function=embedding,
@@ -460,13 +480,13 @@ def _load_vectorstore_and_bm25(kb_path, embedding):
         _bm25_retriever = BM25Okapi(tokenized_corpus)
         _chunks_meta = chunks_meta  # 填充全局，供 _hybrid_search 按 index 查文档
         count = _vectorstore._collection.count()
-        print(f"[RAG] 向量库：{count} 条 | BM25：{len(tokenized_corpus)} 条（来自缓存）")
+        _log(f"[RAG] 向量库：{count} 条 | BM25：{len(tokenized_corpus)} 条（来自缓存）")
         return
 
     # ---- 降级路径：缓存不存在，从磁盘重建 ----
     # 此时 chunks_meta 不为空但 tokenized_corpus 为 None（文件损坏）
     # 需要重新分词并存入缓存，下次就不需要了
-    print("[RAG] BM25 缓存不存在，开始重建...")
+    _log("[RAG] BM25 缓存不存在，开始重建...")
 
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     skip_dirs = {"node_modules", ".git", "__pycache__", ".venv", "venv", "dist", "build", "chroma_db_rag"}
@@ -508,7 +528,7 @@ def _load_vectorstore_and_bm25(kb_path, embedding):
     _save_bm25_index(tokenized_corpus, chunks)
 
     count = _vectorstore._collection.count()
-    print(f"[RAG] 向量库：{count} 条 | BM25：{len(chunks)} 篇（已重建并缓存）")
+    _log(f"[RAG] 向量库：{count} 条 | BM25：{len(chunks)} 篇（已重建并缓存）")
 
 
 # ==========================================
@@ -621,7 +641,7 @@ def rag_search(query: str) -> str:
         lines.append(f"[文档{i+1}] 来源: {source}\n{doc.page_content}")
 
     result = "\n\n".join(lines)
-    print(f"[RAG] 混合检索「{query}」→ 召回 {len(results)} 个文档块 (向量+BM25+RRF)")
+    _log(f"[RAG] 混合检索「{query}」→ 召回 {len(results)} 个文档块 (向量+BM25+RRF)")
     return result
 
 

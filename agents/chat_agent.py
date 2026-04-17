@@ -1,676 +1,669 @@
-# chat_agent.py - 钳钳 Agent (流式版 + LangGraph 循环)
-"""钳钳 Agent - 流式输出 + 思考过程展示 + LangGraph 工具循环
-
-═══════════════════════════════════════════════════════════════
- 技术选型对比
-═══════════════════════════════════════════════════════════════
-
- ┌────────────────┬──────────────────┬──────────────────────────┐
- │ 本项目使用      │ 替代方案          │ 企业级首选               │
- ├────────────────┼──────────────────┼──────────────────────────┤
- │ LangGraph      │ AutoGen, CrewAI  │ LangGraph / Dify         │
- │ LangChain      │ LlamaIndex, Haystack │ LangChain + LangSmith │
- │ ChromaDB       │ FAISS, Milvus    │ Pinecone / Weaviate      │
- │ BM25 (rank_bm25)│ Elasticsearch   │ Elasticsearch / Meilisearch│
- │ ChatOpenAI     │ litellm, instructor │ litellm / httpx 直接调用│
- │ asyncio        │ trio, curio      │ asyncio（标准库，最稳定） │
- │ threading      │ multiprocessing  │ asyncio（IO密集型优先）   │
- └────────────────┴──────────────────┴──────────────────────────┘
-
- 为什么选 LangGraph：
-   - LangChain 团队官方出品，生态集成最好
-   - StateGraph 比 CrewAI 的 "Agent 对话" 模式更灵活，能精确控制流程
-   - 原生支持 conditional_edges（条件路由），适合"思考→调用工具→再思考"循环
-   - 企业用 Dify（可视化编排）时，底层也是类似的 DAG 思路
-
- 为什么选 asyncio：
-   - astream_events 是异步生成器，必须用 async for 遍历
-   - 不能用 sync for（会报 'async_generator' object is not iterable）
-   - 不能用 multiprocessing（GIL 限制 + 进程间通信复杂）
-
- 为什么用 threading 做动画：
-   - 动画是纯 IO（print），asyncio 也能做，但需要和 astream_events 共享事件循环
-   - threading 更简单：独立线程跑动画，主线程处理 LLM 流式输出
-   - daemon=True 确保主程序退出时动画线程自动终止
+# chat_agent.py — My Agent：多会话 + 流式输出 + LangGraph 工具循环
+# 架构：配置层 → 工具层 → Agent核心 → 会话管理 → UI层 → 入口层
 """
+技术栈：LangGraph + LangChain + ChromaDB + BM25 + ChatOpenAI + asyncio
+设计：SessionManager(JSON索引) + AsyncSqliteSaver(历史持久化) + 斜杠命令
+"""
+from __future__ import annotations
 
-# ═══════════════════════════════════════════════════════════════
-# 环境配置（必须在所有 import 之前）
-# ═══════════════════════════════════════════════════════════════
-
-import os
-import sys
-
-# ★ HuggingFace 镜像 — 为什么放在最前面？
-#   Python 的 import 是一次性操作，模块内的全局变量在 import 时就初始化了
-#   langchain_huggingface 内部会在 import 时读取 HF_ENDPOINT
-#   如果放在 import 之后设置，模块已经用默认值初始化完毕，设置不生效
-#   类比：就像你要在咖啡店开门前贴"今日特惠"，开门后再贴就来不及了
-#
-#   企业级做法：
-#     - 用 .env 文件 + python-dotenv（python-dotenv.load_dotenv()）
-#     - 或 Docker 环境变量（docker-compose.yml 的 environment 字段）
-#     - 或 Kubernetes ConfigMap/Secret
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 国内镜像，避免连不上 huggingface.co
-os.environ["HF_HUB_HTTP_TIMEOUT"] = "300"  # 5分钟超时，防止大模型下载中断
-
-import asyncio   # Python 标准库异步框架。替代：trio（更简洁但不主流）、curio
-import time      # 标准库，用于 sleep 和计时
-import random    # 标准库，用于打字动画的随机延迟
-import threading # 标准库，用于 Thinking 动画的独立线程
-
-# 将项目根目录加入 sys.path，使得 `from config.settings` 等导入能正常工作
-# os.path.abspath(__file__) = .../langgraph-learn/agents/chat_agent.py
-# dirname 一次 = .../langgraph-learn/agents/
-# dirname 两次 = .../langgraph-learn/
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# ═══════════════════════════════════════════════════════════════
-# 类型系统
-# ═══════════════════════════════════════════════════════════════
-
-# Annotated: Python 3.9+ 的类型注解增强，可以给类型附加元数据
-#   这里用来给 LangGraph 的 StateGraph 声明 "这个 list 字段用 add_messages 函数合并"
-#   替代：不用 Annotated 的话，需要手写 reducer 函数
+# ══════════════════════════════════════════════════════════════════════════════
+# ① 配置层：环境变量 & 标准库
+# ══════════════════════════════════════════════════════════════════════════════
+import os, sys, json, random, re, threading, time, uuid, signal as _signal, asyncio
+from pathlib import Path
+from dataclasses import asdict, dataclass
 from typing import Annotated
 
-# TypedDict: Python 3.8+ 的类型工具，定义固定 key 的字典类型
-#   用于 LangGraph 的 StateGraph 的状态定义
-#   替代：dataclass（但 LangGraph 要求 TypedDict 或 Pydantic Model）
-#   企业级：Pydantic BaseModel（自带数据验证、序列化）
-from typing_extensions import TypedDict
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# ═══════════════════════════════════════════════════════════════
-# LangChain 核心组件
-# ═══════════════════════════════════════════════════════════════
+# HuggingFace 镜像 + Windows VT100
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_HTTP_TIMEOUT"] = "300"
+if sys.platform == "win32":
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.GetStdHandle(-11)
+    m = ctypes.c_ulong()
+    if k.GetConsoleMode(h, ctypes.byref(m)):
+        k.SetConsoleMode(h, m.value | 0x0004)
 
-# LangChain 消息类型 — 为什么不用普通 dict？
-#   LangChain 的消息链路（LLM → Tool → LLM）需要统一的 Message 对象
-#   每种消息有不同角色：System（系统提示）、Human（用户）、AI（助手）、Tool（工具返回）
-#   如果用 dict，LLM 无法区分消息来源，工具调用会失败
-from langchain_core.messages import (
-    ToolMessage,    # 工具执行结果，必须带 tool_call_id 关联回 AI 的调用请求
-    SystemMessage,  # 系统提示词，定义 Agent 的角色和行为
-    HumanMessage,   # 用户输入
-    AIMessage,      # AI 回复（含 tool_calls 字段）
-)
+# Ctrl+C 打断标志
+_interrupt = threading.Event()
+_signal.signal(_signal.SIGINT, lambda *_: _interrupt.set())
 
-# @tool 装饰器 — 为什么用它？
-#   把普通 Python 函数变成 LangChain Tool 对象
-#   自动提取函数签名（参数名、类型）和 docstring 作为工具描述
-#   LLM 根据描述决定调用哪个工具、传什么参数
-#   替代：手动构造 Tool(name=..., description=..., func=...) — 繁琐且容易出错
-#   企业级：LangSmith + Tool Trace（工具调用的可观测性）
+# ══════════════════════════════════════════════════════════════════════════════
+# ② 配置层：AI 模型 & UI 常量
+# ══════════════════════════════════════════════════════════════════════════════
+THINK_TAGS = [
+    ("<" + "think" + ">", "</" + "think" + ">"),  # MiniMax / DeepSeek（旧版确认）
+    ("<thinking>", "</thinking>"),                 # Qwen
+    ("<think/>", "</think/>"),                     # Gemma
+]
+MAX_BUFFER = 30  # 流式解析 buffer 上限
+
+SYSTEM_PROMPT = """你是活泼开朗、风趣幽默的AI助手。回答认真负责，不猜测未知内容。"""
+
+# ANSI 颜色（终端 UI）
+_A = {"b": "\033[1m", "d": "\033[2m", "c": "\033[36m", "y": "\033[33m",
+      "g": "\033[32m", "r": "\033[31m", "gr": "\033[90m", "0": "\033[0m"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ③ 工具层：LangChain @tool 封装（转发至 tools/ 目录）
+# ══════════════════════════════════════════════════════════════════════════════
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-
-# ChatOpenAI — 为什么用 langchain_openai 而不是 openai 官方 SDK？
-#   1. openai 官方 SDK 只支持 OpenAI 自家模型
-#   2. langchain_openai 通过 openai_api_base 参数支持任何 OpenAI 兼容 API
-#      （如 MiniMax、DeepSeek、Ollama、vLLM 等国产/私有模型）
-#   3. 自带 .bind_tools() 方法，一行代码就能把工具注册给模型
-#   4. 自带 .stream() 方法，支持逐 token 流式输出
-#   替代：
-#     - litellm：统一代理 100+ 模型提供商，企业级首选
-#     - httpx 直接调用：最灵活但要自己处理重试、超时、错误码
 from langchain_openai import ChatOpenAI
-
-# ═══════════════════════════════════════════════════════════════
-# LangGraph — Agent 编排框架
-# ═══════════════════════════════════════════════════════════════
-
-# StateGraph: LangGraph 的核心类，定义 Agent 的执行图（有向无环图 + 条件循环）
-#   为什么不用纯 Python while 循环？
-#     - while 循环也能实现"思考→工具→再思考"，但：
-#       1. 难以可视化（LangGraph 可以生成流程图）
-#       2. 难以扩展（加节点只需 add_node，不用改主循环）
-#       3. 难以调试（LangGraph 每步都有状态快照）
-#       4. 难以持久化（LangGraph 自带 checkpointer 支持断点续跑）
-#   替代：
-#     - CrewAI：多 Agent 协作框架，适合 "研究员+写手+审稿人" 场景
-#     - AutoGen：微软出品，多 Agent 对话模式，适合需要多轮协商的任务
-#     - 自研状态机：灵活但开发量大
-#   企业级：
-#     - LangGraph + LangSmith（全链路追踪 + 评估）
-#     - Dify（可视化 Agent 编排，非程序员也能用）
-from langgraph.graph import StateGraph, START, END
-
-# add_messages: LangGraph 内置的 reducer 函数
-#   作用：当 StateGraph 节点返回 {"messages": [新消息]} 时，
-#   不是替换旧消息列表，而是追加到末尾
-#   这就是为什么 ai_think 返回 {"messages": [response]} 不会覆盖之前的消息
-from langgraph.graph.message import add_messages
-
-# ═══════════════════════════════════════════════════════════════
-# 项目内部模块
-# ═══════════════════════════════════════════════════════════════
-
 from config.settings import API_KEY, API_BASE, MODEL_FAST
-from tools.rag_tool import rag_search as _rag_search_raw, ingest as _ingest_raw
-from tools.weather_tool import get_weather as _get_weather_raw
-
-
-# ═══════════════════════════════════════════════════════════════
-# 思考标签配置（按模型修改）
-# ═══════════════════════════════════════════════════════════════
-# 为什么需要思考标签？
-#   部分 LLM（如 DeepSeek、MiniMax）会在回复前先输出 <think)...(think)> 包裹的思考过程
-#   这些思考内容对用户有参考价值，但不应和正式回复混在一起
-#   StreamParser 会把 <think)...(think)> 内的内容标记为"思考"，外部标记为"回复"
-#
-# 为什么用 "<" + "think" + ">" 而不是直接写 "<think"？
-#   避免某些编辑器/Linter 误认为是 HTML/XML 标签而触发警告
-
-THINK_OPEN = "<" + "think" + ">"   # 思考开始标签
-THINK_CLOSE = "</" + "think" + ">" # 思考结束标签
-MAX_BUFFER = 30  # 超过 30 字符还没找到标签 → 强制当作回复内容（兼容无思考标签的模型）
-
-SYSTEM_PROMPT = """你是"钳钳"，一个活泼开朗、风趣幽默的AI助手。性格特点：
-- 活泼开朗，喜欢用emoji表达情感
-- 回答问题时认真负责，但保持幽默风格
-- 喜欢用比喻和类比来解释复杂概念
-- 对技术话题特别感兴趣
-
-你可以使用工具来回答问题。当用户问的问题可能需要查资料时，主动使用工具。"""
-
-
-# ═══════════════════════════════════════════════════════════════
-# 工具定义 — Agent 的"双手"
-# ═══════════════════════════════════════════════════════════════
-# @tool 装饰器做了什么？
-#   1. 读取函数签名 → 生成 JSON Schema（LLM 用来知道传什么参数）
-#   2. 读取 docstring → 生成工具描述（LLM 用来决定什么时候调用）
-#   3. 包装成 BaseTool 对象 → 可以被 bind_tools() 绑定到 LLM
-#
-# 企业级工具设计原则：
-#   1. docstring 要精确：说明什么时候用、什么时候不用
-#   2. 参数要有类型注解：LLM 根据类型传参（str vs int vs list）
-#   3. 返回值要简洁：太长的结果会浪费 token，截取关键信息
-#   4. 加安全校验：路径遍历、SQL 注入等（见 add_knowledge 的校验）
-
+from tools.rag_tool import rag_search as _rs, ingest as _ing
+from tools.weather_tool import get_weather as _gw
+from tools.search.web_search_tool import web_search as _wss
+from tools.search.web_fetch_tool import web_fetch as _wfs
 
 @tool
 def get_weather(city: str) -> str:
     """查询城市天气"""
-    return _get_weather_raw(city)
-
+    return _gw(city)
 
 @tool
 def rag_search(query: str) -> str:
-    """搜索游梦的个人知识库"""
-    return _rag_search_raw(query)
-
+    """搜索现有知识库（默认是游梦的Obsidian）"""
+    return _rs(query)
 
 @tool
 def add_knowledge(folder_path: str) -> str:
-    """将文件夹里的文档加入知识库"""
-    # 安全校验：只允许绝对路径，防止 LLM 传入相对路径导致意外访问
+    """将文件夹里的文档加入知识库（强制重建索引）"""
     if not os.path.isabs(folder_path):
         return "请提供绝对路径"
     if not os.path.isdir(folder_path):
         return f"目录不存在: {folder_path}"
-    _ingest_raw(folder_path, force=True)
-    return f"入库完成！现在可以问我关于这些文档的问题了。"
+    _ing(folder_path, force=True)
+    return "入库完成！"
 
+@tool
+def get_current_time() -> str:
+    """获取当前日期、时间和星期几（系统本地时区）"""
+    from datetime import datetime
+    now = datetime.now()
+    try:
+        import time as _t
+        tz = _t.tzname[0]
+    except Exception:
+        tz = ""
+    return f"{now.strftime('%Y-%m-%d %A %H:%M:%S')} ({tz})"
 
-# 工具列表 — 传给 bind_tools()，LLM 会看到所有可用工具
-tools = [get_weather, rag_search, add_knowledge]
+ALL_TOOLS = [get_weather, rag_search, add_knowledge, get_current_time, _wss, _wfs]
 
-
-# ═══════════════════════════════════════════════════════════════
-# LangGraph 状态与节点
-# ═══════════════════════════════════════════════════════════════
-# LangGraph 的核心概念：
-#
-#   1. State（状态）— 所有节点共享的数据
-#      就像一条流水线上的传送带，每个工位（节点）都能读取和追加
-#
-#   2. Node（节点）— 处理逻辑的函数
-#      接收 State，返回 State 的更新（增量）
-#
-#   3. Edge（边）— 节点之间的连接
-#      普通边：A → B（固定走向）
-#      条件边：A → B 或 A → C（根据返回值决定走向）
-#
-# 本项目的流程图：
-#
-#   START → ai_think → should_use_tool?
-#                        ├── "done"     → END
-#                        └── "use_tool" → execute_tool → ai_think（循环）
-#
-#   这就是经典的 ReAct (Reason + Act) 模式：
-#     Reason: ai_think（LLM 思考下一步做什么）
-#     Act:    execute_tool（执行工具）
-#     Observe: 工具结果自动追加到 messages，LLM 看到后再次思考
+# ══════════════════════════════════════════════════════════════════════════════
+# ④ Agent 核心层：LangGraph 状态图
+# ══════════════════════════════════════════════════════════════════════════════
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from typing_extensions import TypedDict
 
 class AgentState(TypedDict):
-    """LangGraph 状态定义
+    messages: Annotated[list, add_messages]  # 消息历史链表
 
-    messages 字段用了 Annotated[list, add_messages]：
-      - 普通的 dict 赋值是覆盖：state["messages"] = [新消息] → 旧消息没了
-      - 加了 add_messages reducer 后是追加：新消息会被 append 到旧列表末尾
-      - 这保证了每轮 LLM 调用都能看到完整的对话历史
-    """
-    messages: Annotated[list, add_messages]
+llm = ChatOpenAI(model_name=MODEL_FAST, openai_api_key=API_KEY, openai_api_base=API_BASE)
+llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
+def _sanitize_messages(msgs: list) -> list:
+    """确保消息序列符合 API 要求：tool_use 后必须紧跟 tool_result"""
+    clean = [m for m in msgs if not isinstance(m, SystemMessage)]
+    result = []
+    for m in clean:
+        # 检查前一条是否是带 tool_calls 的 AIMessage
+        if result and hasattr(result[-1], "tool_calls") and result[-1].tool_calls:
+            if isinstance(m, ToolMessage):
+                result.append(m)
+            else:
+                # tool_use 后面不是 ToolMessage → 用空结果补上
+                for tc in result[-1].tool_calls:
+                    result.append(ToolMessage(content="[工具调用被中断，无结果]", tool_call_id=tc["id"]))
+                result.append(m)
+        else:
+            # ToolMessage 没有对应的 tool_use → 跳过
+            if isinstance(m, ToolMessage):
+                # 检查是否有匹配的 tool_use
+                has_match = False
+                for prev in result:
+                    if hasattr(prev, "tool_calls") and prev.tool_calls:
+                        if any(tc["id"] == m.tool_call_id for tc in prev.tool_calls):
+                            has_match = True
+                            break
+                if not has_match:
+                    continue  # 丢弃孤儿 ToolMessage
+            result.append(m)
+    return result
 
-# LLM 实例 — 为什么在模块级别创建而不是函数内部？
-#   1. 避免重复创建（HTTP 连接池、模型配置只需要初始化一次）
-#   2. LangGraph 的 compiled graph 在模块加载时就构建，需要引用 llm_model
-#   企业级：用依赖注入（FastAPI 的 Depends）或配置类
-llm_model = ChatOpenAI(
-    model_name=MODEL_FAST,
-    openai_api_key=API_KEY,
-    openai_api_base=API_BASE,  # 指向 MiniMax / DeepSeek 等兼容 API
-)
+def _parse_retry_wait(err_msg: str) -> float:
+    """从 API 错误信息中提取建议等待秒数，找不到则返回 None"""
+    # 常见格式："Please retry after 20 seconds" / "请等待30秒后重试" / "rate limit ... 20s"
+    for pat in [
+        r'(?:retry\s*after|wait|等待)\s*(\d+(?:\.\d+)?)\s*(?:s|sec|second|秒)',
+        r'rate\s*limit.*?(\d+(?:\.\d+)?)\s*(?:s|sec|second|秒)',
+        r'(\d+(?:\.\d+)?)\s*(?:s|sec|second|秒).*(?:retry|重试)',
+        r'retry.*?(\d+(?:\.\d+)?)\s*(?:ms|msec|millisecond|毫秒)',
+    ]:
+        m = re.search(pat, err_msg, re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            # 毫秒转秒
+            if 'ms' in m.group(0).lower() or '毫秒' in m.group(0):
+                return val / 1000
+            return val
+    return None
 
-# bind_tools() 做了什么？
-#   把工具的 JSON Schema 注册到 LLM 的请求参数中
-#   LLM 每次调用时都会看到可用工具列表，根据需要选择调用
-#   如果 LLM 决定调用工具，返回的 AIMessage 会包含 tool_calls 字段
-llm_with_tools = llm_model.bind_tools(tools)
+MAX_LLM_RETRIES = 10
 
+def _think(state: AgentState) -> dict:
+    """过滤 SystemMessage + 修复消息序列 后调用 LLM（含重试）"""
+    safe_msgs = _sanitize_messages(state["messages"])
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        try:
+            return {"messages": [llm_with_tools.invoke(safe_msgs)]}
+        except Exception as e:
+            is_last = attempt == MAX_LLM_RETRIES
+            err_msg = str(e)
+            # 最后一次尝试直接抛出，不再重试
+            if is_last:
+                raise
+            # 从错误信息提取等待时间，没有则指数退避
+            wait = _parse_retry_wait(err_msg) or min(2 ** attempt, 60)
+            print(f"\n  {_A['y']}⚠ LLM 第{attempt}次调用失败，{wait:.1f}s 后重试: {_A['d']}{err_msg[:120]}{_A['0']}")
+            time.sleep(wait)
 
-def ai_think(state: AgentState) -> dict:
-    """AI 思考节点
+def _exec_tool(state: AgentState) -> dict:
+    """依次执行 LLM 请求的工具，结果通过 ToolMessage 回传（异常不外抛，交给 LLM 处理）"""
+    last = state["messages"][-1]
+    tmap = {t.name: t for t in ALL_TOOLS}
+    results = []
+    for tc in last.tool_calls:
+        t = tmap.get(tc["name"])
+        if not t:
+            results.append(ToolMessage(content=f"[工具错误] 未知工具: {tc['name']}", tool_call_id=tc["id"]))
+            continue
+        try:
+            results.append(ToolMessage(content=str(t.invoke(tc["args"])), tool_call_id=tc["id"]))
+        except Exception as e:
+            results.append(ToolMessage(content=f"[工具错误] {tc['name']} 执行失败: {e}", tool_call_id=tc["id"]))
+    return {"messages": results}
 
-    接收完整的消息历史（含之前的工具结果），调用 LLM 获取下一步动作。
+def _route(state: AgentState) -> str:
+    return "use_tool" if getattr(state["messages"][-1], "tool_calls", None) else "done"
 
-    返回的 {"messages": [response]} 不是替换，而是追加（因为有 add_messages reducer）。
-    """
-    response = llm_with_tools.invoke(state["messages"])
-    return {"messages": [response]}
+_g = StateGraph(AgentState)
+_g.add_node("think", _think)
+_g.add_node("exec_tool", _exec_tool)
+_g.add_edge(START, "think")
+_g.add_conditional_edges("think", _route, {"use_tool": "exec_tool", "done": END})
+_g.add_edge("exec_tool", "think")
 
-
-def execute_tool(state: AgentState) -> dict:
-    """工具执行节点
-
-    从最后一条 AIMessage 中提取 tool_calls，逐个执行，返回 ToolMessage 列表。
-
-    为什么需要 tool_call_id？
-      LLM 可以一次请求调用多个工具（parallel tool calls）
-      每个 tool_call 有唯一 id，ToolMessage 必须关联回对应的 id
-      否则 LLM 无法把工具结果和自己的请求配对
-    """
-    last_message = state["messages"][-1]
-    tool_calls = last_message.tool_calls
-
-    tool_messages = []
-    for tc in tool_calls:
-        tool_name = tc["name"]
-        tool_args = tc["args"]
-        tool_function = {t.name: t for t in tools}[tool_name]
-        result = tool_function.invoke(tool_args)
-        tool_messages.append(
-            ToolMessage(content=str(result), tool_call_id=tc["id"])
-        )
-
-    return {"messages": tool_messages}
-
-
-def should_use_tool(state: AgentState) -> str:
-    """条件路由：判断 LLM 是想调用工具还是直接回复
-
-    返回值对应 add_conditional_edges 的映射表：
-      "use_tool" → execute_tool 节点
-      "done"     → END（对话结束）
-    """
-    last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "use_tool"
-    return "done"
-
-
-# ── 组装 LangGraph 状态图 ──
-#
-# add_edge(A, B):            固定边，A 执行完必定走到 B
-# add_conditional_edges(A, fn, mapping): 条件边，根据 fn 返回值查 mapping 决定走向
-# add_node(name, fn):        注册节点，fn 是处理函数
-# compile():                 编译为可执行的 Runnable，支持 invoke / stream / astream_events
-_builder = StateGraph(AgentState)
-_builder.add_node("ai_think", ai_think)          # 节点1：LLM 思考
-_builder.add_node("execute_tool", execute_tool)    # 节点2：工具执行
-_builder.add_edge(START, "ai_think")               # 入口 → 先思考
-_builder.add_conditional_edges(
-    "ai_think",                                     # 从思考节点出发
-    should_use_tool,                                # 路由函数
-    {"use_tool": "execute_tool", "done": END},     # 映射表
-)
-_builder.add_edge("execute_tool", "ai_think")       # 工具执行完 → 回到思考
-_graph = _builder.compile()                          # 编译成可执行的图
-
-
-# ═══════════════════════════════════════════════════════════════
-# 流式标签解析器 StreamParser
-# ═══════════════════════════════════════════════════════════════
-# 为什么需要这个？
-#
-# LLM 流式输出时，一个 <think...> 标签可能被切分成多个 chunk：
-#   chunk1: "我需要<thi"
-#   chunk2: "nk>分析一下..."
-#   chunk3: "用户意图</th"
-#   chunk4: "ink>你好！"
-#
-# 如果直接逐 chunk 检测标签，"thi" + "nk" 这种切分会导致标签丢失
-# StreamParser 用 buffer 累积 + 滑动窗口的方式可靠地处理任意切分
-#
-# 工作原理：
-#   1. chunk 到达 → 追加到 buffer
-#   2. _drain() 扫描 buffer 中的标签
-#   3. 找到完整标签 → 把之前的内容放入队列（标记为 thinking 或 reply）
-#   4. 没找到 → 只释放"安全"部分（不会被标签切分的前缀），剩余留着等更多 chunk
-#   5. _flush() 返回队列中的内容给调用方
-
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑤ 流式解析层：StreamParser（处理思考标签被分包切断）
+# ══════════════════════════════════════════════════════════════════════════════
 class StreamParser:
-    """可靠处理标签被切分的流式解析器"""
-
+    """识别 <think/> 标签，分流模型输出为正文/思考两类"""
     def __init__(self):
-        self.buffer = ""         # 累积未处理的文本
-        self.in_thinking = False  # 当前是否在 <think...> 标签内
-        self._queue = []          # 输出队列：[(is_thinking, text), ...]
+        self.buf = ""
+        self.in_think = False
+        self.q: list[tuple[bool, str]] = []
 
-    def feed(self, chunk: str):
-        """喂入一个 chunk，返回可立即输出的文本列表"""
-        self.buffer += chunk
+    def feed(self, chunk: str) -> list[tuple[bool, str]]:
+        self.buf += chunk
         self._drain()
         return self._flush()
 
-    def done(self):
-        """流结束时，把 buffer 中剩余内容全部输出"""
-        if self.buffer:
-            self._queue.append((self.in_thinking, self.buffer))
-            self.buffer = ""
+    def done(self) -> list[tuple[bool, str]]:
+        if self.buf:
+            self.q.append((self.in_think, self.buf))
+            self.buf = ""
+            self.in_think = False
         return self._flush()
 
+    def _tag(self, text: str, opening: bool) -> tuple[int, int]:
+        for o, c in THINK_TAGS:
+            idx = text.find(o if opening else c)
+            if idx >= 0:
+                return idx, len(o if opening else c)
+        return -1, 0
+
     def _drain(self):
-        """扫描 buffer，提取可安全输出的文本"""
         while True:
-            if self.in_thinking:
-                # 在思考模式内：找 </think...> 结束标签
-                idx = self.buffer.find(THINK_CLOSE)
-                if idx >= 0:
-                    # 找到结束标签 → 标签前的内容是思考内容
-                    before = self.buffer[:idx]
-                    if before:
-                        self._queue.append((True, before))
-                    self.buffer = self.buffer[idx + len(THINK_CLOSE):]
-                    self.in_thinking = False
+            if self.in_think:
+                i, l = self._tag(self.buf, opening=False)
+                if i >= 0:
+                    if self.buf[:i]:
+                        self.q.append((True, self.buf[:i]))
+                    self.buf = self.buf[i + l:]
+                    self.in_think = False
                 else:
-                    # 没找到 → 释放"安全"部分（保留结束标签长度的余量）
-                    safe = max(0, len(self.buffer) - len(THINK_CLOSE))
-                    if safe > 0:
-                        self._queue.append((True, self.buffer[:safe]))
-                        self.buffer = self.buffer[safe:]
                     break
             else:
-                # 在回复模式内：找 <think...> 开始标签
-                idx = self.buffer.find(THINK_OPEN)
-                if idx >= 0:
-                    before = self.buffer[:idx]
-                    if before:
-                        self._queue.append((False, before))
-                    self.buffer = self.buffer[idx + len(THINK_OPEN):]
-                    self.in_thinking = True
+                i, l = self._tag(self.buf, opening=True)
+                if i >= 0:
+                    if self.buf[:i]:
+                        self.q.append((False, self.buf[:i]))
+                    self.buf = self.buf[i + l:]
+                    self.in_think = True
                 else:
-                    # 没找到开始标签
-                    if len(self.buffer) > MAX_BUFFER:
-                        # 超过 MAX_BUFFER 还没出现标签 → 大概率不是思考标签
-                        # （兼容 GLM 等不带思考标签的模型）
-                        self._queue.append((False, self.buffer))
-                        self.buffer = ""
-                        break
-                    # 释放安全部分，保留开始标签长度的余量
-                    safe = max(0, len(self.buffer) - len(THINK_OPEN))
-                    if safe > 0:
-                        self._queue.append((False, self.buffer[:safe]))
-                        self.buffer = self.buffer[safe:]
+                    max_l = max(len(o) for o, _ in THINK_TAGS)
+                    if len(self.buf) > MAX_BUFFER + max_l:
+                        self.q.append((False, self.buf))
+                        self.buf = ""
                     break
 
-    def _flush(self):
-        """返回并清空输出队列"""
-        out = self._queue[:]
-        self._queue.clear()
+    def _flush(self) -> list[tuple[bool, str]]:
+        out = self.q[:]
+        self.q.clear()
         return out
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑥ 会话管理层：SessionManager（JSON持久化 + LRU排序）
+# ══════════════════════════════════════════════════════════════════════════════
+_SF = Path(__file__).parent.parent / "sessions.json"
 
-# ═══════════════════════════════════════════════════════════════
-# UI 辅助 — Thinking 动画 + 逐字打印
-# ═══════════════════════════════════════════════════════════════
+@dataclass
+class Session:
+    thread_id: str  # UUID[:8]，关联 LangGraph thread_id
+    name: str
+    created_at: float
+    updated_at: float
 
-# threading.Event: 线程安全的"信号灯"
-#   set() → 绿灯（停止等待）
-#   clear() → 红灯（继续等待）
-#   is_set() → 查看当前状态
-#   替代：asyncio.Event（但动画线程是独立线程，不用 asyncio）
-thinking_stop = threading.Event()
+class SessionManager:
+    """sessions.json 持久化 + 按最后活跃时间 LRU 排序"""
+    def __init__(self, f: Path = _SF):
+        self._f = f
+        self._data = self._load()
 
-# 动画帧：所有帧等宽（11字符），用空格补齐
-# 为什么必须等宽？
-#   \b（backspace）回退的字符数是固定的（回退 11 个）
-#   如果帧宽度不同：
-#     "Thinking." (9字符) → 回退 11 → 多回退 2 个 → 残留上一帧的 2 个字符
-#     导致 "Thinking." 变成 "Thinking.." 或 "TThinking."
-#   等宽后每帧都是 11 字符，回退 11 个刚好覆盖干净
-_THINKING_FRAMES = ["Thinking   ", "Thinking.  ", "Thinking.. ", "Thinking..."]
-_THINKING_MAX_LEN = len(_THINKING_FRAMES[-1])  # 11
+    def _load(self) -> dict:
+        if self._f.exists():
+            try: return json.loads(self._f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, IOError): pass
+        return {"sessions": [], "active_thread_id": "default"}
 
+    def _save(self):
+        self._f.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def thinking_loop():
-    """后台线程：Thinking 动画（固定宽度 + \\b 回退）
+    @property
+    def active_id(self) -> str:
+        return self._data.get("active_thread_id", "default")
 
-    为什么用 \\b 而不是 \\r（回车）？
-      \\r 在 Windows 终端的行为不一致：
-        - cmd.exe：光标回到行首，可以覆盖
-        - PowerShell：光标不动或行为怪异
-        - Windows Terminal：有时有效有时无效
-      \\b（退格）是标准 ASCII 控制字符（0x08），所有终端都支持
+    @property
+    def active_session(self) -> Session | None:
+        for s in self.list_sessions():
+            if s.thread_id == self.active_id:
+                return s
+        return None
 
-    为什么不用 \\x1b[2K（ANSI 清行）？
-      虽然更优雅，但 Windows 旧版 cmd 不支持 ANSI 转义序列
-      （Windows 10+ 需要 EnableVirtualTerminalProcessing）
-    """
+    def list_sessions(self) -> list[Session]:
+        ss = [Session(**d) for d in self._data.get("sessions", []) if isinstance(d, dict)]
+        ss.sort(key=lambda s: s.updated_at, reverse=True)
+        return ss
+
+    def create(self, name: str = None) -> Session:
+        s = Session(uuid.uuid4().hex[:8],
+                    name or f"session_{len(self.list_sessions()) + 1}",
+                    time.time(), time.time())
+        self._data.setdefault("sessions", []).append(asdict(s))
+        self._data["active_thread_id"] = s.thread_id
+        self._save()
+        return s
+
+    def switch(self, index: int) -> Session:
+        ss = self.list_sessions()
+        if not 1 <= index <= len(ss):
+            raise ValueError(f"序号超出范围 (1-{len(ss)})")
+        self._data["active_thread_id"] = ss[index - 1].thread_id
+        self._save()
+        return ss[index - 1]
+
+    def switch_by_name(self, name: str) -> Session:
+        ms = [s for s in self.list_sessions() if name.lower() in s.name.lower()]
+        if not ms: raise ValueError(f"未找到: {name}")
+        if len(ms) > 1: raise ValueError(f"多个匹配 '{name}': {[s.name for s in ms]}")
+        self._data["active_thread_id"] = ms[0].thread_id
+        self._save()
+        return ms[0]
+
+    def rename(self, new_name: str):
+        for s in self._data.get("sessions", []):
+            if s.get("thread_id") == self.active_id:
+                s["name"] = new_name
+                break
+        self._save()
+
+    def delete(self, index: int) -> str:
+        ss = self.list_sessions()
+        if not 1 <= index <= len(ss): raise ValueError(f"序号超出范围 (1-{len(ss)})")
+        removed = ss[index - 1]
+        dl = self._data.get("sessions", [])
+        dl.pop(index - 1)
+        self._data["sessions"] = dl
+        if self._data.get("active_thread_id") == removed.thread_id:
+            self._data["active_thread_id"] = dl[0]["thread_id"] if dl else "default"
+        self._save()
+        return removed.thread_id
+
+    def touch(self, tid: str = None):
+        t = tid or self.active_id
+        for s in self._data.get("sessions", []):
+            if s.get("thread_id") == t:
+                s["updated_at"] = time.time()
+                break
+        self._save()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑦ UI层：终端动画 & 打字机效果
+# ══════════════════════════════════════════════════════════════════════════════
+_SPIN_STOP = threading.Event()
+_SPIN_LABEL = "Thinking"
+_SPIN_INFO = ""
+_SPIN_THREAD: threading.Thread | None = None
+_SPIN_START = 0.0
+_SP = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_LC = {"Thinking": _A["y"], "tool_calling": _A["c"]}
+
+def _elapsed(s: float) -> str:
+    s = int(s)
+    if s < 60: return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60: return f"{m}m{s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m}m{s}s"
+
+def _cw(s: str) -> int:
+    w = 0
+    for c in s:
+        cp = ord(c)
+        w += 2 if (0x4E00 <= cp <= 0x9FFF or 0x3000 <= cp <= 0x303F or
+                    0xFF01 <= cp <= 0xFF60 or 0x2018 <= cp <= 0x201F) else 1
+    return w
+
+def _trunc(text: str, avail: int) -> str:
+    if _cw(text) <= avail: return text
+    h2 = (avail - 3) // 2
+    def _w(c): cp = ord(c); return 0x4E00 <= cp <= 0x9FFF or 0x3000 <= cp <= 0x303F or 0xFF01 <= cp <= 0xFF60 or 0x2018 <= cp <= 0x201F
+    head, w = [], 0
+    for c in text:
+        cw = 2 if _w(c) else 1
+        if w + cw > h2: break
+        head.append(c); w += cw
+    tail, w = [], 0
+    for c in reversed(text):
+        cw = 2 if _w(c) else 1
+        if w + cw > h2: break
+        tail.append(c); w += cw
+    return ''.join(head) + '...' + ''.join(reversed(tail))
+
+def _spin_loop():
     i = 0
-    # 先打印初始帧（否则会有短暂空白）
-    sys.stdout.write(_THINKING_FRAMES[0])
-    sys.stdout.flush()
-    while not thinking_stop.is_set():
-        time.sleep(0.4)
-        i += 1
-        frame = _THINKING_FRAMES[i % len(_THINKING_FRAMES)]
-        # 回退最大宽度 + 写新帧 = 覆盖式动画
-        sys.stdout.write("\b" * _THINKING_MAX_LEN + frame)
+    while not _SPIN_STOP.is_set():
+        sp = _SP[i % len(_SP)]
+        color = _LC.get(_SPIN_LABEL, _A["y"])
+        e = _elapsed(time.time() - _SPIN_START)
+        timer = f"（{e}）" if time.time() - _SPIN_START >= 5 else ""
+        if _SPIN_INFO:
+            sys.stdout.write(f"\r\033[2K  {color}{sp} {_SPIN_LABEL}...{timer}{_A['0']}\n"
+                             f"\r\033[2K    {_A['d']}⎿ {_SPIN_INFO}{_A['0']}\033[1A")
+        else:
+            sys.stdout.write(f"\r\033[2K  {color}{sp} {_SPIN_LABEL}...{timer}{_A['0']}")
         sys.stdout.flush()
+        time.sleep(0.08)
+        i += 1
 
+def start_spinner(label: str = "Thinking", info: str = ""):
+    global _SPIN_THREAD, _SPIN_LABEL, _SPIN_INFO, _SPIN_START
+    if _SPIN_THREAD and _SPIN_THREAD.is_alive():
+        _SPIN_STOP.set(); _SPIN_THREAD.join(timeout=1); _SPIN_STOP.clear()
+    _SPIN_LABEL = label
+    try: cols = os.get_terminal_size().columns
+    except OSError: cols = 80
+    _SPIN_INFO = _trunc(info, max(cols - 8, 20))
+    _SPIN_START = time.time()
+    _SPIN_STOP.clear()
+    # 启动前先输出换行，让 spinner 与上方内容有间距
+    sys.stdout.write("\n"); sys.stdout.flush()
+    _SPIN_THREAD = threading.Thread(target=_spin_loop, daemon=True)
+    _SPIN_THREAD.start()
 
-def stop_thinking(thinking_th):
-    """安全停止动画线程
+def stop_spinner(success: bool = True):
+    global _SPIN_THREAD, _SPIN_INFO
+    was = _SPIN_THREAD and _SPIN_THREAD.is_alive()
+    if was:
+        _SPIN_STOP.set(); _SPIN_THREAD.join(timeout=2)
+        mk = f"{_A['g']}●{_A['0']}" if success else f"{_A['r']}●{_A['0']}"
+        if _SPIN_INFO:
+            sys.stdout.write(f"\r\033[2K  {mk} {_SPIN_LABEL}{_A['0']}\n"
+                             f"\r\033[2K    {_A['d']}⎿ {_SPIN_INFO}{_A['0']}\n")
+        else:
+            sys.stdout.write(f"\r\033[2K  {mk} {_SPIN_LABEL}{_A['0']}\n")
+        sys.stdout.flush()
+    _SPIN_THREAD = None; _SPIN_INFO = ""
 
-    为什么不擦行？
-      之前的版本在停止时用空格覆盖 Thinking 文字 → 用户反馈"思考完 Thinking 消失了"
-      现在保留 Thinking 文字，由后续的 print() 或换行自然覆盖
-      用户体验：看到 Thinking... → 思考内容 → Agent > 回复
-    """
-    if not thinking_stop.is_set():
-        thinking_stop.set()
-        thinking_th.join(timeout=2)  # 等线程退出，最多 2 秒（防止死锁）
-        print()  # Thinking 后换行，让后续内容在新行显示
+def type_text(text: str, delay: float = 0.025):
+    for c in text:
+        print(c, end="", flush=True)
+        time.sleep(delay * (0.5 + random.random()))
 
+def _rel(ts: float) -> str:
+    e = time.time() - ts
+    if e < 60: return "刚刚"
+    if e < 3600: return f"{int(e // 60)}分钟前"
+    if e < 86400: h = int(e // 3600); return "1小时前" if h == 1 else f"{h}小时前"
+    if e < 172800: return "昨天"
+    return f"{int(e // 86400)}天前"
 
-def type_text(text: str, base_delay: float = 0.025):
-    """逐字打印（打字机效果）
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑧ UI层：会话列表渲染 & 交互式选择
+# ══════════════════════════════════════════════════════════════════════════════
+def _render_list(mgr: SessionManager):
+    ss = mgr.list_sessions()
+    aid = mgr.active_id
+    print(f"\n{_A['c']}{_A['b']}{'#':<4} {'名称':<20} {'ID':<12} {'更新'}{_A['0']}")
+    print(f"{_A['d']}{'─' * 52}{_A['0']}")
+    for i, s in enumerate(ss, 1):
+        ia = s.thread_id == aid
+        p = f"{_A['g']}*{_A['0']}" if ia else " "
+        nc = _A["g"] if ia else _A["gr"]
+        nm = s.name[:18] if len(s.name) <= 18 else s.name[:16] + ".."
+        ts = _rel(s.updated_at)
+        mk = f"{p}{nc}{i:<3}{_A['0']}"
+        if ia:
+            print(f"{mk} {_A['b']}{_A['c']}{nm:<20}{_A['0']} {s.thread_id:<12} {_A['d']}{ts}{_A['0']}")
+        else:
+            print(f"{mk} {nm:<20} {s.thread_id:<12} {_A['gr']}{ts}{_A['0']}")
+    cur = mgr.active_session
+    print(f"\n  {_A['g']}当前:{_A['0']} {cur.name if cur else '默认'} · 共 {len(ss)} 个会话")
 
-    为什么加随机延迟？
-      固定延迟看起来像机器人，加 random.random() 的微小抖动更自然
-      base_delay * (0.5 + random) → 实际延迟在 0.5x ~ 1.5x 之间波动
-    """
-    for char in text:
-        print(char, end="", flush=True)  # flush=True：立即显示，不等缓冲区满
-        time.sleep(base_delay * (0.5 + random.random()))
-
-
-# ═══════════════════════════════════════════════════════════════
-# 主程序
-# ═══════════════════════════════════════════════════════════════
-
-def main():
-    print("=" * 50)
-    print("  Agent (流式版 + LangGraph 循环, quit 退出)")
-    print("=" * 50)
-
-    messages_history = []  # 多轮对话历史（保留之前的 Human + AI 消息）
-
+async def _select(mgr: SessionManager) -> Session | None:
+    ss = mgr.list_sessions()
+    if not ss:
+        print(f"\n  {_A['y']}没有可切换的会话，输入 /new 创建{_A['0']}")
+        return None
+    aid = mgr.active_id
+    print(f"\n  {_A['c']}{_A['b']}选择会话{_A['0']}{_A['d']} (Enter确认 Esc取消){_A['0']}")
+    for i, s in enumerate(ss, 1):
+        ia = s.thread_id == aid
+        mk = f"{_A['g']}*{_A['0']}" if ia else " "
+        dn = s.name[:24] if len(s.name) <= 24 else s.name[:22] + ".."
+        if ia:
+            print(f"  {mk} {_A['b']}{_A['g']}{i}.{_A['0']} {_A['b']}{dn}{_A['0']}  {_A['d']}{_rel(s.updated_at)}{_A['0']}")
+        else:
+            print(f"  {mk} {i}. {dn}  {_A['gr']}{_rel(s.updated_at)}{_A['0']}")
     while True:
         try:
-            user_input = input("\nUser > ").strip()
+            ch = input(f"\r  {_A['c']}> {_A['0']}").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n再见!")
-            break
-
-        if not user_input:
-            continue
-        if user_input in ("quit", "exit", "q"):
-            print("再见!")
-            break
-        if user_input == "clear":
-            os.system("cls")
-            continue
-
-        print()
-
-        # ── 启动 Thinking 动画 ──
-        # 每轮对话开始前重置状态，启动新的动画线程
-        thinking_stop.clear()
-        thinking_th = threading.Thread(target=thinking_loop, daemon=True)
-        thinking_th.start()
-        # daemon=True：主程序退出时动画线程自动终止，不会卡住
-
-        # 每轮对话独立的解析器和状态
-        parser = StreamParser()
-        thinking_printed = False  # 是否已经打印过思考内容
-        response_started = False  # 是否已经开始打印正式回复
-
-        # 构建消息列表（含历史）
-        # LangGraph 每次调用是独立的推理过程，不会记住上一轮
-        # 所以要把历史消息都传进去，LLM 才有上下文
-        full_messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=user_input),
-        ]
-        for msg in messages_history:
-            full_messages.append(msg)
-
-        # ── LangGraph 流式事件循环 ──
-        # astream_events 返回的事件类型：
-        #   on_chat_model_start:  LLM 开始新一轮调用
-        #   on_chat_model_stream: LLM 逐 token 输出
-        #   on_tool_start:        工具开始执行
-        #   on_tool_end:          工具执行完毕
-        #
-        # 为什么用 asyncio.run() 包装？
-        #   astream_events 是 async generator（异步生成器）
-        #   必须用 async for 遍历，不能直接 for
-        #   asyncio.run() 创建一个临时事件循环来运行异步函数
-        #   替代：把 main() 改成 async def main()，用 asyncio.run(main())
-        #         但这样 input() 也需要用 asyncio.to_thread 包装，更复杂
+            print(f"\n  {_A['d']}(已取消){_A['0']}")
+            return None
+        if not ch: continue
         try:
-            async def consume_events():
-                nonlocal thinking_printed, response_started, parser, thinking_th
-                # nonlocal 的作用：
-                #   consume_events 是嵌套函数，要修改外层的局部变量
-                #   没有 nonlocal → Python 认为赋值操作创建的是局部变量
-                #   读取时局部变量还没赋值 → UnboundLocalError
-                llm_round = 0  # 追踪 LLM 调用轮次（第1轮 / 工具后的第2轮...）
+            idx = int(ch)
+            if 1 <= idx <= len(ss): return ss[idx - 1]
+            print(f"  {_A['r']}序号超出范围 (1-{len(ss)}){_A['0']}")
+        except ValueError:
+            try: return mgr.switch_by_name(ch)
+            except ValueError as e: print(f"  {_A['r']}{e}{_A['0']}")
 
-                async for event in _graph.astream_events(
-                    {"messages": full_messages},
-                    version="v2",  # v2 是 LangGraph 推荐的事件格式
-                ):
-                    event_type = event.get("event", "")
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑨ 命令层：斜杠命令处理器
+# ══════════════════════════════════════════════════════════════════════════════
+async def _cmd(cmd: str, graph, mgr: SessionManager) -> bool:
+    """斜杠命令分发：/help /sessions /new /switch /rename /delete /quit"""
+    p = cmd.strip().split(maxsplit=1)
+    a, arg = p[0].lower(), (p[1].strip() if len(p) > 1 else "")
 
-                    # ── LLM 新一轮思考开始 ──
-                    if event_type == "on_chat_model_start":
-                        # 第2轮及以后：工具执行完毕后，LLM 会再次思考
-                        # 需要重新启动动画线程（之前的已经 stop 了）
-                        if llm_round > 0:
-                            thinking_stop.clear()
-                            thinking_th = threading.Thread(
-                                target=thinking_loop, daemon=True
-                            )
-                            thinking_th.start()
-                        llm_round += 1
+    if a in ("/help", "/?"):
+        print(f"\n{_A['b']}{_A['c']}可用命令:{_A['0']}")
+        print(f"  {_A['g']}/sessions{_A['0']} / {_A['g']}/ls{_A['0']}          列出所有会话")
+        print(f"  {_A['g']}/new [名称]{_A['0']}              新建并切换到新会话")
+        print(f"  {_A['g']}/switch <序号|名称>{_A['0']}       切换会话（支持 {_A['g']}/s{_A['0']}）")
+        print(f"  {_A['g']}/rename <名称>{_A['0']}             重命名当前会话")
+        print(f"  {_A['g']}/delete <序号>{_A['0']}           删除指定会话")
+        print(f"  {_A['g']}/quit{_A['0']} / {_A['g']}/q{_A['0']}             退出程序\n")
+        return False
 
-                    # ── LLM 流式输出 token ──
-                    elif event_type == "on_chat_model_stream":
-                        chunk = event["data"]["chunk"]
-                        content = getattr(chunk, "content", "") or ""
-                        if not content:
-                            continue
+    if a in ("/quit", "/q"): return True
+    if a in ("/sessions", "/ls"): _render_list(mgr); return False
 
-                        # 用 StreamParser 解析思考/回复边界
-                        for is_thinking, text in parser.feed(content):
-                            if is_thinking:
-                                # 思考内容：停动画 + 打印
-                                if not thinking_printed:
-                                    stop_thinking(thinking_th)
-                                    thinking_printed = True
-                                type_text(text, 0.03)
+    if a == "/new":
+        s = mgr.create(arg or None)
+        print(f"\n  ✅ 新建会话: {s.name} ({s.thread_id})")
+        return False
 
-                            else:
-                                # 正式回复：每轮都独立输出 "Agent > "
-                                if not response_started:
-                                    stop_thinking(thinking_th)
-                                    if thinking_printed:
-                                        print()
-                                    print("Agent > ", end="", flush=True)
-                                    response_started = True
-                                type_text(text, 0.025)
+    if a in ("/switch", "/s"):
+        if not arg:
+            sel = await _select(mgr)
+            if sel: mgr.switch_by_name(sel.name); print(f"\n  ✅ 已切换到: {sel.name} ({sel.thread_id})")
+            return False
+        try: s = mgr.switch(int(arg.strip())); print(f"\n  ✅ 已切换到: {s.name} ({s.thread_id})")
+        except ValueError:
+            try: s = mgr.switch_by_name(arg); print(f"\n  ✅ 已切换到: {s.name} ({s.thread_id})")
+            except ValueError as e: print(f"\n  ✗ {e}")
+        return False
 
-                    # ── 工具执行开始 ──
-                    elif event_type == "on_tool_start":
-                        inp = event["data"].get("input", {})
-                        tool_name = (
-                            inp.get("name", "")
-                            if isinstance(inp, dict) else str(inp)
-                        )
-                        print(f"\n\n  \U0001f527 调用工具: {tool_name}")
+    if a == "/rename":
+        if not arg: print(f"\n  {_A['y']}用法: /rename <新名称>{_A['0']}"); return False
+        old = mgr.active_session.name if mgr.active_session else "默认"
+        mgr.rename(arg); print(f"\n  ✅ 重命名: '{old}' → '{arg}'"); return False
 
-                    # ── 工具执行结束 ──
-                    # ★ 关键：重置所有状态，让下一轮 LLM 输出完全独立
-                    elif event_type == "on_tool_end":
-                        result = event["data"].get("output", "")
-                        print(f"\n  \u2705 结果: {str(result)[:200]}")
-                        response_started = False       # 下轮重新输出 "Agent > "
-                        thinking_printed = False       # 下轮重新处理思考标签
-                        parser = StreamParser()        # 清空解析器，不残留旧 token
+    if a == "/delete":
+        if not arg: print(f"\n  {_A['y']}用法: /delete <序号>{_A['0']}"); _render_list(mgr); return False
+        try: tid = mgr.delete(int(arg.strip())); print(f"\n  🗑️ 已删除会话: {tid}")
+        except ValueError as e: print(f"\n  ✗ {e}")
+        return False
 
-            asyncio.run(consume_events())
+    print(f"  {_A['r']}未知命令: {a}（输入 /help 查看帮助）{_A['0']}")
+    return False
 
-        except Exception as e:
-            stop_thinking(thinking_th)
-            print(f"\n  [错误: {e}]")
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑩ 对话循环层：核心消息处理
+# ══════════════════════════════════════════════════════════════════════════════
+async def _turn(graph, user_input: str, thread_id: str):
+    """单轮对话：Thinking动画 → LangGraph流式 → 解析正文/思考 → 工具动画 → 打印"""
+    global tp, rp
+    tp = rp = False
 
-        # 处理解析器缓冲区中的剩余内容（流结束后的兜底）
-        for is_thinking, text in parser.done():
-            if is_thinking:
-                if not thinking_printed:
-                    stop_thinking(thinking_th)
-                    thinking_printed = True
-                type_text(text, 0.03)
-            else:
-                if not response_started:
-                    stop_thinking(thinking_th)
-                    if thinking_printed:
-                        print()
-                    print("Agent > ", end="", flush=True)
-                    response_started = True
-                type_text(text, 0.025)
+    start_spinner("Thinking")
+    parser = StreamParser()
 
-        # 兜底：如果 LLM 一个 token 都没返回，也要停动画
-        if not thinking_printed and not response_started:
-            stop_thinking(thinking_th)
-            print("Agent > (无回复)")
+    # API不支持system角色，系统指令通过 HumanMessage 合并传递（避免双 HumanMessage 打断 tool 链）
+    inp = {"messages": [
+        HumanMessage(content=f"[系统指令]\n{SYSTEM_PROMPT}\n\n[用户消息]\n{user_input}"),
+    ]}
+    cfg = {"configurable": {"thread_id": thread_id}}
 
-        print()
+    try:
+        rnd = 0
+        async for ev in graph.astream_events(inp, config=cfg, version="v2"):
+            if _interrupt.is_set(): raise KeyboardInterrupt("打断")
+            et = ev.get("event", "")
 
+            if et == "on_chat_model_start":
+                if rnd > 0: start_spinner("Thinking")
+                rnd += 1
+
+            elif et == "on_chat_model_stream":
+                chunk = ev["data"]["chunk"]
+                content = getattr(chunk, "content", "") or ""
+                if not content: continue
+                for is_t, text in parser.feed(content):
+                    if is_t:
+                        if not tp:
+                            stop_spinner(); tp = True
+                            sys.stdout.write(_A["gr"]); sys.stdout.flush()
+                        type_text(text.replace("\n", "\n    "), 0.03)
+                    else:
+                        if not rp:
+                            stop_spinner()
+                            if tp: sys.stdout.write(_A["0"]); print()
+                            print(f"{_A['c']}Agent{_A['0']} ", end="", flush=True); rp = True
+                        type_text(text.replace("\n", "\n    "), 0.025)
+
+            elif et == "on_tool_start":
+                nm = ev.get("name", "unknown")
+                inp2 = ev.get("data", {}).get("input", {})
+                params = "，".join(f'{k}="{v}"' if isinstance(v, str) else f'{k}={v}' for k, v in inp2.items()) if inp2 else ""
+                info = f"{nm}（{params}）" if params else nm
+                stop_spinner(); start_spinner("tool_calling", info)
+
+            elif et == "on_tool_end":
+                stop_spinner()
+                tp = rp = False
+                parser = StreamParser()
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        stop_spinner(); print(f"\n{_A['y']}⏹ 已打断{_A['0']}"); _interrupt.clear(); return
+    except Exception as e:
+        stop_spinner(); print(f"\n  [{_A['r']}错误: {e}{_A['0']}]")
+
+    # 刷出剩余内容
+    for is_t, text in parser.done():
+        if is_t:
+            if not tp: stop_spinner(); tp = True; sys.stdout.write(f"{_A['d']}{_A['gr']}"); sys.stdout.flush()
+            type_text(text.replace("\n", "\n    "), 0.03)
+        else:
+            if not rp:
+                stop_spinner()
+                if tp: sys.stdout.write(_A["0"]); print()
+                print(f"{_A['c']}Agent{_A['0']} ", end="", flush=True); rp = True
+            type_text(text.replace("\n", "\n    "), 0.025)
+
+    if not tp and not rp: stop_spinner(); print(f"{_A['c']}Agent{_A['0']} (无回复)")
+    elif tp and not rp: sys.stdout.write(_A["0"])
+    print()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⑪ 入口层：主程序
+# ══════════════════════════════════════════════════════════════════════════════
+async def run_chat_loop(graph, mgr: SessionManager):
+    while True:
+        sn = mgr.active_session.name if mgr.active_session else "默认"
+        try: ui = input(f"{_A['g']}> {_A['d']}[{sn}]{_A['0']} ").strip()
+        except (EOFError, KeyboardInterrupt): print(f"\n{_A['c']}再见！👋{_A['0']}"); break
+        if not ui: continue
+        if ui.startswith("/"):
+            if await _cmd(ui, graph, mgr): print(f"\n{_A['c']}再见！👋{_A['0']}"); break
+            continue
+        await _turn(graph, ui, mgr.active_id)
+        mgr.touch()
+
+async def main():
+    print(f"\n╔{'═' * 48}╗\n║  🤖 {_A['b']}My Agent — 1.0.0{_A['0']}{' ' * 27}║\n╚{'═' * 48}╝\n")
+    mgr = SessionManager()
+    if not mgr.list_sessions():
+        d = mgr.create("默认")
+        print(f"  {_A['d']}已创建默认会话: {d.name} ({d.thread_id}){_A['0']}")
+    cur = mgr.active_session
+    if cur: print(f"  当前会话:{_A['d']} {cur.name} ({cur.thread_id}){_A['0']}")
+    print(f"  共 {len(mgr.list_sessions())} 个会话 · 输入 {_A['c']}/help{_A['0']} 查看命令\n")
+
+    db = Path(__file__).parent.parent / "chat_history.db"
+    cm = AsyncSqliteSaver.from_conn_string(str(db))
+    async with cm as ck:
+        graph = _g.compile(checkpointer=ck)
+        await run_chat_loop(graph, mgr)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
