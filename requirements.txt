@@ -29,6 +29,9 @@ Pillow>=10.0.0
 # HTTP 请求
 requests>=2.31.0
 
+# TUI 终端界面（Claude Code 风格）
+textual>=0.80.0
+
 # 环境变量管理
 python-dotenv>=1.0.0
 
