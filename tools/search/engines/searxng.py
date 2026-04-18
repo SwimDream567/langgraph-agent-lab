@@ -36,7 +36,7 @@ class SearXNGEngine(SearchEngine):
         base_url: str,
         categories: str = "general",
         language: str = "zh-CN",
-        timeout: int = 15,
+        timeout: int = 8,
     ):
         self.base_url = base_url.rstrip("/")
         self.categories = categories
@@ -52,7 +52,7 @@ class SearXNGEngine(SearchEngine):
         try:
             resp = requests.get(
                 f"{self.base_url}/healthz",
-                timeout=5,
+                timeout=2,
                 headers={"User-Agent": "QianQianAgent/1.0"},
             )
             return resp.status_code == 200
