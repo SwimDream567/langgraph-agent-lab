@@ -433,11 +433,12 @@ def stop_spinner(success: bool = True):
     if was:
         _SPIN_STOP.set(); _SPIN_THREAD.join(timeout=2)
         mk = f"{_A['g']}●{_A['0']}" if success else f"{_A['r']}●{_A['0']}"
+        elapsed = _elapsed(time.time() - _SPIN_START)
         if _SPIN_INFO:
-            sys.stdout.write(f"\r\033[2K  {mk} {_SPIN_LABEL}{_A['0']}\n"
+            sys.stdout.write(f"\r\033[2K  {mk} {_SPIN_LABEL}（{elapsed}）{_A['0']}\n"
                              f"\r\033[2K    {_A['d']}⎿ {_SPIN_INFO}{_A['0']}\n")
         else:
-            sys.stdout.write(f"\r\033[2K  {mk} {_SPIN_LABEL}{_A['0']}\n")
+            sys.stdout.write(f"\r\033[2K  {mk} {_SPIN_LABEL}（{elapsed}）{_A['0']}\n")
         sys.stdout.flush()
     _SPIN_THREAD = None; _SPIN_INFO = ""
 
