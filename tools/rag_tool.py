@@ -40,6 +40,7 @@ import os
 import re
 import hashlib
 import json
+from langchain_core.tools import tool
 
 # ==========================================
 # 配置（复用项目 settings）
@@ -619,16 +620,9 @@ def _hybrid_search(query: str, top_k: int = 4):
     return result_docs
 
 
+@tool
 def rag_search(query: str) -> str:
-    """在 Obsidian 知识库中混合检索（向量 + BM25 + RRF）
-
-    仅当用户问到关于游梦的个人信息时才调用此工具。
-
-    Args:
-        query: 用户的自然语言问题
-
-    Returns:
-        格式化的检索结果，包含文档来源和内容片段
+    """搜索现有知识库（默认是游梦的Obsidian）。当用户问到关于游梦的个人信息、简历、项目经历、技术栈时调用。
     """
     results = _hybrid_search(query, top_k=4)
 
@@ -643,6 +637,17 @@ def rag_search(query: str) -> str:
     result = "\n\n".join(lines)
     _log(f"[RAG] 混合检索「{query}」→ 召回 {len(results)} 个文档块 (向量+BM25+RRF)")
     return result
+
+
+@tool
+def add_knowledge(folder_path: str) -> str:
+    """将文件夹里的文档加入知识库（强制重建索引）。文件夹路径必须是绝对路径。"""
+    if not os.path.isabs(folder_path):
+        return "请提供绝对路径"
+    if not os.path.isdir(folder_path):
+        return f"目录不存在: {folder_path}"
+    ingest(folder_path, force=True)
+    return "入库完成！"
 
 
 def create_rag_tool():

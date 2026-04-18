@@ -1,14 +1,15 @@
-"""全局配置 - API Key 和模型参数
+"""全局配置 - 多模型注册表
 
-这里集中管理所有 API 配置，避免在每个文件里重复写 Key。
-类似 Java 里的 application.yml
+.env 格式:
+  ACTIVE_MODEL=minimax              ← 当前激活模型名
+  MODEL_<名称>_KEY=sk-xxx           ← API Key
+  MODEL_<名称>_BASE=https://...     ← API Base URL
+  MODEL_<名称>_ID=model-name        ← 模型ID
 
-⚠️ API Key 从 .env 文件读取，不要硬编码到代码里！
+切模型：改 .env 的 ACTIVE_MODEL，或用 /models 命令运行时切换
+加模型：在 .env 照格式加三行 MODEL_<名称>_{KEY,BASE,ID}，重启生效
 """
 
-# ==========================================
-# 环境变量加载（必须在最前面）
-# ==========================================
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -19,81 +20,124 @@ load_dotenv()
 if not os.environ.get("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 if not os.environ.get("HF_HUB_HTTP_TIMEOUT"):
-    os.environ["HF_HUB_HTTP_TIMEOUT"] = "300"  # 5分钟超时
+    os.environ["HF_HUB_HTTP_TIMEOUT"] = "300"
 
 # ==========================================
-# GLM API（智谱，兼容 OpenAI 格式）
+# Embedding 配置
 # ==========================================
-GLM_API_KEY = os.environ.get("GLM_API_KEY", "")
-GLM_API_BASE = os.environ.get("GLM_API_BASE", "https://open.bigmodel.cn/api/coding/paas/v4")
-
-GLM_FAST = "glm-5.1"       # 快速便宜，日常用
-GLM_STRONG = "glm-5.1"      # 更强但更贵，复杂任务用
+HF_EMBED_MODEL = os.environ.get("HF_EMBED_MODEL", "BAAI/bge-large-zh-v1.5")
+HF_EMBED_DIM   = int(os.environ.get("HF_EMBED_DIM", "1024"))
 
 # ==========================================
-# MiniMax API（兼容 OpenAI 格式）
-# ==========================================
-MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
-MINIMAX_API_BASE = os.environ.get("MINIMAX_API_BASE", "https://api.minimaxi.com/v1")
-
-MINIMAX_CHAT = "MiniMax-M2.7"     # MiniMax 文本对话模型
-
-# ==========================================
-# Ollama 本地模型（兼容 OpenAI 格式）
-# ==========================================
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
-OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434/v1")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4-fast")
-
-# ==========================================
-# Embedding 模型配置
+# 多模型注册表
 # ==========================================
 
-# Ollama 本地 Embedding（免费，英文为主）
-# OLLAMA_EMBED_MODEL = "nomic-embed-text"
-# OLLAMA_EMBED_DIM = 768
+def _parse_models() -> dict:
+    """从环境变量解析所有模型配置
 
-# HuggingFace 本地 Embedding（免费，中文优化，推荐）
-# BAAI/bge-large-zh-v1.5：1024维，中文 MTEB 霸榜，语义表达能力强
-# 模型已缓存在 ~/.cache/huggingface/hub/，首次运行自动下载（约 1.2GB）
-HF_EMBED_MODEL = "BAAI/bge-large-zh-v1.5"
-HF_EMBED_DIM = 1024  # 输出 1024 维向量，中文语义表达更强
+    格式: MODEL_<NAME>_KEY / MODEL_<NAME>_BASE / MODEL_<NAME>_ID
+    返回: {name: {key, base, id}, ...}
+    """
+    models = {}
+    for key, value in os.environ.items():
+        if not key.startswith("MODEL_") or not value:
+            continue
+        parts = key[6:]  # 去掉 "MODEL_"
+        idx = parts.rfind("_")
+        if idx == -1:
+            continue
+        name = parts[:idx].lower()
+        field = parts[idx + 1:].lower()
+        if field not in ("key", "base", "id"):
+            continue
+        if name not in models:
+            models[name] = {}
+        models[name][field] = value
 
-# OpenAI Embedding（收费，仅当以上都不可用时启用）
-# EMBEDDING_MODEL = "text-embedding-3-small"  # 1536维
-# EMBEDDING_MODEL = "text-embedding-3-large"  # 3072维
+    # 至少需要 KEY + ID 才算有效
+    models = {k: v for k, v in models.items()
+              if "key" in v and "id" in v}
+
+    # 兼容旧格式：如果没有 MODEL_* 但有 LLM_*，自动迁移
+    if not models:
+        _k = os.environ.get("LLM_API_KEY", "")
+        _b = os.environ.get("LLM_API_BASE", "")
+        _m = os.environ.get("LLM_MODEL", "")
+        if _k and _m:
+            models["default"] = {"key": _k, "base": _b, "id": _m}
+
+    return models
+
+
+ALL_MODELS = _parse_models()
+ACTIVE_MODEL_NAME = os.environ.get("ACTIVE_MODEL", "").lower()
+
+
+class ModelRegistry:
+    """运行时模型管理：列表、切换、解析引用"""
+
+    def __init__(self):
+        self._models = ALL_MODELS
+        self._names = list(ALL_MODELS.keys())
+        self._active = ACTIVE_MODEL_NAME
+        if self._active not in self._models and self._names:
+            self._active = self._names[0]
+
+    # --- 属性 ---
+
+    @property
+    def active_name(self) -> str:
+        return self._active
+
+    @property
+    def active_config(self) -> dict:
+        return self._models.get(self._active, {})
+
+    # --- 查询 ---
+
+    def list_all(self) -> list:
+        """返回 [(name, config), ...] 保持 .env 定义顺序"""
+        return [(n, self._models[n]) for n in self._names]
+
+    def resolve(self, ref: str) -> str:
+        """解析引用（名称 / 序号 / 部分匹配）→ 模型名"""
+        ref = ref.strip().lower()
+        # 1. 精确名称
+        if ref in self._models:
+            return ref
+        # 2. 序号
+        try:
+            idx = int(ref) - 1
+            if 0 <= idx < len(self._names):
+                return self._names[idx]
+        except ValueError:
+            pass
+        # 3. 前缀匹配
+        matches = [n for n in self._names if n.startswith(ref)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"多个模型匹配 '{ref}': {', '.join(matches)}")
+        raise ValueError(
+            f"未知模型: {ref}（可用: {', '.join(self._names)}）")
+
+    # --- 切换 ---
+
+    def switch(self, ref: str) -> tuple:
+        """切换模型。返回 (旧名称, 新名称)"""
+        name = self.resolve(ref)
+        old = self._active
+        self._active = name
+        return old, name
+
 
 # ==========================================
-# 动态模型切换（只改 .env 的 PROVIDER 即可）
+# 兼容旧代码的属性导出
 # ==========================================
-# .env 里设置 PROVIDER=ollama / glm / minimax
-# 不需要改这个文件！
+_registry = ModelRegistry()
+_active = _registry.active_config
 
-PROVIDER = os.environ.get("PROVIDER", "ollama").lower()
-
-_providers = {
-    "ollama": {
-        "api_key": OLLAMA_API_KEY,
-        "api_base": OLLAMA_API_BASE,
-        "fast": OLLAMA_MODEL,
-        "strong": OLLAMA_MODEL,
-    },
-    "glm": {
-        "api_key": GLM_API_KEY,
-        "api_base": GLM_API_BASE,
-        "fast": GLM_FAST,
-        "strong": GLM_STRONG,
-    },
-    "minimax": {
-        "api_key": MINIMAX_API_KEY,
-        "api_base": MINIMAX_API_BASE,
-        "fast": MINIMAX_CHAT,
-        "strong": GLM_STRONG,
-    },
-}
-
-_active = _providers.get(PROVIDER, _providers["ollama"])
-API_KEY = _active["api_key"]
-API_BASE = _active["api_base"]
-MODEL_FAST = _active["fast"]
-MODEL_STRONG = _active["strong"]
+API_KEY    = _active.get("key", "")
+API_BASE   = _active.get("base", "")
+MODEL_FAST = _active.get("id", "gpt-4o-mini")
+MODEL_STRONG = os.environ.get("LLM_MODEL_STRONG", MODEL_FAST)

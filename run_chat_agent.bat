@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1 & REM 切换 UTF-8 编码（支持中文输出）
+set "LAUNCH_DIR=%cd%"
 cd /d "%~dp0"
 
 REM 检查 venv 是否存在

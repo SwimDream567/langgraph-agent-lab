@@ -20,16 +20,15 @@
 """
 
 import requests
+from langchain_core.tools import tool
 
 
+@tool
 def get_weather(city: str) -> str:
     """查询城市实时天气（免费 API，无需 Key）
 
     Args:
         city: 城市名称，如"北京"、"深圳"、"Shanghai"
-
-    Returns:
-        格式化的天气信息字符串
     """
     try:
         # wttr.in 的 JSON 接口
