@@ -215,18 +215,6 @@ SEARXNG_BASE_URL=http://localhost:8888
 SEARCH_FALLBACK=duckduckgo     # 备用引擎
 ```
 
-## 🎯 面试亮点
-
-本项目的技术决策和踩坑经验可作为面试素材：
-
-| 亮点 | 说明 |
-|------|------|
-| **MiniMax 不支持 SystemMessage** | 所有系统指令合并到 HumanMessage，包括子 Agent 工具描述和路由 prompt |
-| **Agent 按能力域划分** | 参考 LangGraph/CrewAI/AutoGen，按能力域而非工具种类划分 |
-| **手动 StateGraph 代替 create_react_agent** | 官方 API 生成 SystemMessage，MiniMax 不兼容，手写 think → exec_tool 循环 |
-| **孤儿 tool_calls 清理** | `_sanitize_messages()` 解决旧 checkpoint 数据导致 API 400 错误 |
-| **路由默认兜底策略** | 不确定时默认走主 Agent，比精确分类更稳定 |
-
 ## 📊 学习路线
 
 | 练习 | 文件 | 学到什么 |
