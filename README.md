@@ -6,15 +6,20 @@
 
 - **Multi-Agent 架构** — Supervisor 路由：主 Agent（全能）+ Coder（代码专家）+ Planner（研究规划）
 - **主 Agent 全能** — 13 个工具全部可用，大部分对话直接处理，不再绕一圈委托
-- **多 Provider 切换** — Ollama / 智谱 GLM / MiniMax，改一行配置即可
+- **多模型注册表** — `/models` 运行时热切换，支持继承配置（共用 KEY/BASE，只换 MODEL_ID）
+- **三层上下文压缩** — L1 MicroCompact（0 成本）+ L2 会话记忆（0 成本）+ L3 LLM 摘要
+- **MCP 动态加载器** — 读取 `.mcp.json`，持久 session + 热重载 + 斜杠命令管理
+- **工具输出预算** — 固定上限 + 截断感知提示，agent 主动补读
 - **流式输出 + 思考动画** — 实时流式响应，Braille 点阵思考动画
 - **联网搜索** — SearXNG / DuckDuckGo，工厂模式 + 主备降级
 - **网页抓取** — URL 自动识别并抓取内容
 - **企业级 RAG** — ChromaDB + BM25 + RRF 融合检索，增量入库，支持 46 种文件格式
 - **文件操作** — 读取/搜索/写入/编辑文件，执行 Shell 命令
 - **多会话管理** — SQLite 持久化，支持新建/切换/重命名/删除会话
+- **会话记忆追踪** — 零 API 调用，自动追踪文件/工具/话题，注入每轮对话
 - **工具容错 + LLM 重试** — 工具异常不崩溃，API 错误自动重试（最多 10 次）
-- **MiniMax 兼容** — 不依赖 SystemMessage，所有指令合并到 HumanMessage
+- **Ollama 预热防重入** — 后台加载模型，Banner 先行显示
+- **熔断器 + 冷却机制** — 压缩失败自动降频，防止死循环
 
 ## 📸 项目架构
 
@@ -40,6 +45,13 @@
         │(wttr.in) │ │(SearXNG/ │  │(ChromaDB+│  │(read/write│
         │          │ │ DuckDuck)│  │ BM25+RRF)│  │ /edit)   │
         └──────────┘ └──────────┘  └──────────┘  └──────────┘
+              │            │              │              │
+              └────────────┼──────────────┼──────────────┘
+                           ↓
+              ┌─────────────────────────────────┐
+              │     三层上下文管理（Claude Code 风格） │
+              │  L1 MicroCompact → L2 记忆追踪 → L3 LLM 摘要  │
+              └─────────────────────────────────┘
 ```
 
 ## 🏗️ Multi-Agent 设计
@@ -60,7 +72,10 @@
 |------|------|------|
 | **Agent 编排** | LangGraph StateGraph | 手动 think → exec_tool 循环 |
 | **多 Agent** | Supervisor 模式 | 路由节点 + 子 Agent StateGraph |
-| **LLM** | MiniMax M2.7 / 智谱 GLM / Ollama | 兼容 OpenAI API 格式，一键切换 |
+| **LLM** | MiniMax / 智谱 GLM / DeepSeek / 通义千问 / Ollama | OpenAI 兼容格式，`/models` 热切换 |
+| **多模型注册表** | ModelRegistry | 环境变量声明 + 继承配置 + 运行时切换 |
+| **上下文管理** | context_manager.py | L1 清除旧工具输出 → L2 会话记忆 → L3 LLM 摘要 |
+| **MCP** | mcp_loader.py | 读取 `.mcp.json`，持久 session + 热重载 |
 | **Embedding** | BAAI/bge-large-zh-v1.5 | 1024 维，中文 MTEB 霸榜 |
 | **向量库** | ChromaDB | 本地持久化，零配置 |
 | **关键词检索** | BM25 (rank_bm25) | 稀疏检索，精确匹配 ID/术语 |
@@ -77,7 +92,7 @@
 ```
 langgraph-agent-lab/
 ├── agents/                     # Agent 实现
-│   ├── chat_agent.py           # ⭐ 核心：Supervisor + Multi-Agent（~800 行）
+│   ├── chat_agent.py           # ⭐ 核心：Supervisor + Multi-Agent（~1200 行）
 │   ├── session_manager.py      # 多会话管理（SQLite + JSON 索引）
 │   └── ui/                     # UI 模块
 │       ├── spinner.py          # Braille 点阵思考动画
@@ -94,9 +109,13 @@ langgraph-agent-lab/
 │   ├── rag_tool.py             # ⭐ 企业级 RAG（混合检索 + 增量入库 + BM25 缓存）
 │   ├── weather_tool.py         # 天气查询（wttr.in，免费无 Key）
 │   ├── time_tool.py            # 当前时间查询
-│   ├── file_ops.py             # 文件读取/列表/搜索（read_file, list_dir, search_file, search_content）
+│   ├── file_ops.py             # 文件读取/列表/搜索
 │   ├── file_edit.py            # 文件编辑（write_file, edit_file）
 │   ├── shell_tool.py           # Shell 命令执行（run_command）
+│   ├── context_manager.py      # ⭐ 三层上下文压缩（Claude Code 风格）
+│   ├── mcp_loader.py           # ⭐ MCP 动态加载器（持久 session + 热重载）
+│   ├── output_budget.py        # ⭐ 工具输出预算（固定上限 + 截断感知提示）
+│   ├── session_memory.py       # ⭐ 会话记忆追踪（零成本，纯规则提取）
 │   └── search/                 # 联网搜索
 │       ├── base.py             # 搜索引擎抽象基类
 │       ├── engine_factory.py   # 引擎工厂（主备降级）
@@ -106,9 +125,9 @@ langgraph-agent-lab/
 │           ├── searxng.py      # SearXNG（自建）
 │           └── duckduckgo.py   # DuckDuckGo（免 Key）
 ├── config/
-│   └── settings.py             # ⭐ 动态 Provider 切换 + 环境变量管理
+│   └── settings.py             # ⭐ 多模型注册表（环境变量声明 + 继承 + 热切换）
 ├── .env.example                # 环境变量模板
-├── run_chat_agent.bat          # Windows 一键启动
+├── .mcp.json                   # MCP 服务器配置（.gitignore 排除）
 └── requirements.txt
 ```
 
@@ -142,7 +161,32 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # 编辑 .env，填入你的 API Key
-# 设置 PROVIDER=ollama / glm / minimax 选择 LLM
+```
+
+`.env` 配置示例：
+
+```bash
+# ── 方式一：简单配置（单模型）──
+LLM_API_KEY=你的API_Key
+LLM_API_BASE=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+
+# ── 方式二：多模型注册表（推荐）──
+ACTIVE_MODEL=minimax
+
+# MiniMax（主模型）
+MODEL_MINIMAX_KEY=你的MiniMax_Key
+MODEL_MINIMAX_BASE=https://api.minimaxi.com/v1
+MODEL_MINIMAX_ID=MiniMax-M2.7
+
+# DeepSeek（继承 MiniMax 的 KEY/BASE，只换模型 ID）
+# MODEL_DEEPSEEK_INHERIT=minimax
+# MODEL_DEEPSEEK_ID=deepseek-chat
+
+# Ollama 本地（免费）
+# MODEL_OLLAMA_KEY=ollama
+# MODEL_OLLAMA_BASE=http://localhost:11434/v1
+# MODEL_OLLAMA_ID=gemma4:e4b
 ```
 
 ### 5. 启动 Agent
@@ -160,36 +204,96 @@ python agents/chat_agent.py
 | `/switch <id>` | 切换到指定会话 |
 | `/rename <name>` | 重命名当前会话 |
 | `/delete` | 删除当前会话 |
-| `/models` | 列出可用模型 |
+| `/models` | 列出/切换可用模型 |
+| `/mcp` | 管理 MCP 服务器 |
 | `/help` | 显示帮助 |
 | `/quit` | 退出 |
 
 ## 🔍 核心功能
+
+### 三层上下文压缩
+
+对标 Claude Code 的上下文管理策略：
+
+```
+Layer 1: MicroCompact（0 成本）
+  → 清除旧工具输出（白名单机制），保留最近 N 条
+  → 回收 60-70% token，不破坏消息结构
+
+Layer 2: 会话记忆追踪（0 成本）
+  → 纯规则提取文件路径、工具调用、用户话题
+  → 自动去重，超容量时淘汰旧条目
+  → 注入每轮对话，控制在 800 字符内
+
+Layer 3: LLM 摘要压缩（有成本）
+  → 触发阈值：估算 token 数 > CONTEXT_COMPACT_THRESHOLD
+  → LLM 一次性摘要 + 修剪旧消息
+  → 熔断器：压缩失败自动冷却 3 轮
+```
 
 ### Multi-Agent 路由
 
 Supervisor 根据用户意图自动路由：
 
 ```
-用户: "你好"                          → Agent（主 Agent 直接回复）
-用户: "这个网站是什么？https://..."    → Agent（主 Agent 调用 web_fetch）
-用户: "帮我写一个完整的爬虫项目"       → Agent | Coder（委托代码专家）
-用户: "帮我做 Spring Boot vs Quarkus 技术选型" → Agent | Planner（委托研究专家）
+用户: "你好"                          → chat（主 Agent 直接回复）
+用户: "这个网站是什么？https://..."    → chat（调用 web_fetch）
+用户: "帮我写一个完整的爬虫项目"       → coder（委托代码专家）
+用户: "帮我做 Spring Boot vs Quarkus 技术选型" → planner（委托研究专家）
 ```
 
-### 多 Provider 切换
+### 多模型注册表
 
-只需修改 `.env` 中一行配置：
+支持运行时 `/models` 热切换，继承配置避免重复写 KEY/BASE：
 
 ```bash
-# 使用 MiniMax（推荐）
-PROVIDER=minimax
+# .env 中声明多个模型
+ACTIVE_MODEL=minimax
+MODEL_MINIMAX_KEY=sk-xxx
+MODEL_MINIMAX_BASE=https://api.minimaxi.com/v1
+MODEL_MINIMAX_ID=MiniMax-M2.7
 
-# 使用智谱 GLM
-PROVIDER=glm
+# 同供应商多模型：继承 KEY/BASE，只换 ID
+MODEL_MINIMAX_PRO_INHERIT=minimax
+MODEL_MINIMAX_PRO_ID=MiniMax-M2.7-Pro
 
-# 使用 Ollama 本地模型（免费）
-PROVIDER=ollama
+# 不同供应商：完整声明
+MODEL_DEEPSEEK_KEY=sk-yyy
+MODEL_DEEPSEEK_BASE=https://api.deepseek.com/v1
+MODEL_DEEPSEEK_ID=deepseek-chat
+```
+
+### MCP 动态加载器
+
+读取项目根目录 `.mcp.json`，连接外部 MCP 服务器：
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"],
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+特性：
+- 持久 session（工具调用复用同一连接）
+- 热重载（检测配置文件变化，自动重新加载）
+- MCP 工具自动分配给所有 Agent
+
+### 工具输出预算
+
+固定上限 + 截断感知提示（对标 Claude Code）：
+
+```
+read_file      → 30,000 字符
+run_command    → 10,000 字符
+search_content →  8,000 字符
+...
+截断时自动提示 agent：内容被截断，请用 offset/limit 分段读取
 ```
 
 ### RAG 混合检索
@@ -223,7 +327,7 @@ SEARCH_FALLBACK=duckduckgo     # 备用引擎
 | 02 | `basics/02_stategraph_agent.py` | StateGraph 白盒搭建 |
 | 03 | `basics/03_interactive_agent.py` | 交互式对话 + 真实 API |
 | 04 | `basics/04_free_weather_agent.py` | 零配置 Skill 风格 |
-| ⭐ | `agents/chat_agent.py` | Multi-Agent Supervisor + 全能主 Agent + 工具容错 + 多会话 |
+| ⭐ | `agents/chat_agent.py` | Multi-Agent Supervisor + 上下文管理 + MCP + 多模型 |
 
 ## 📄 License
 
