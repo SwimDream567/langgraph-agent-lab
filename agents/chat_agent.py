@@ -13,6 +13,17 @@ from typing_extensions import TypedDict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# 调试日志（写到文件，不受 stdout guard / logging level 影响）
+_DEBUG_LOG_PATH = Path(__file__).parent.parent / "debug.log"
+def _debug_log(msg: str):
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            import datetime
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ① 配置层：环境变量 & 平台适配
 # ══════════════════════════════════════════════════════════════════════════════
@@ -30,6 +41,22 @@ if sys.platform == "win32":
 _interrupt = threading.Event()
 _signal.signal(_signal.SIGINT, lambda *_: _interrupt.set())
 
+# ── 全局图容器（支持热切换模型时重建） ──
+_runtime = {
+    "graph": None,          # 编译后的 CompiledGraph（带 checkpointer）
+    "HM": None,             # HumanMessage 类
+    "TM": None,             # ToolMessage 类
+    "ck": None,             # AsyncSqliteSaver 实例
+    "ck_ctx": None,         # async context manager（保持 alive）
+    "llm": None,            # ChatOpenAI 实例（供 Layer 3 摘要压缩 + supervisor 用）
+    "bind_chat": None,      # llm.bind_tools(MAIN_TOOLS) — 热切换时更新
+    "bind_coder": None,     # llm.bind_tools(CODER_TOOLS)
+    "bind_planner": None,   # llm.bind_tools(PLANNER_TOOLS)
+    "ready": threading.Event(),
+    "error": None,
+    "model_name": None,     # 当前模型名
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ② 轻量导入层：UI & 会话管理（秒级）
 # ══════════════════════════════════════════════════════════════════════════════
@@ -42,6 +69,7 @@ from config.settings import ModelRegistry
 
 _model_registry = ModelRegistry()
 _total_tokens = [0]  # 累计 token 消耗
+_compact_cooldown = [0]  # 自动压缩冷却计数（成功后设 3，每轮 -1）
 
 # Agent 显示名
 _AGENT_NAMES = {"chat": "Agent", "coder": "Coder", "planner": "Planner"}
@@ -50,15 +78,11 @@ _AGENT_NAMES = {"chat": "Agent", "coder": "Coder", "planner": "Planner"}
 def _get_env_block():
     """生成环境信息块（cwd/time 在 _turn 里动态替换）"""
     home = str(Path.home())
-    user_name = os.environ.get("USERNAME", os.environ.get("USER", "unknown"))
     return f"""## 运行环境
-- 用户：{user_name}
 - 系统：Windows
 - 主目录：{home}
 - 当前工作目录：{{cwd}}
-- 当前时间：{{current_time}}
-
-当用户给相对路径时，基于 {{cwd}} 解析。"""
+- 当前时间：{{current_time}}"""
 
 
 ENV_BLOCK = _get_env_block()
@@ -95,6 +119,14 @@ def _build_tools():
     _ToolMessage = ToolMessage
     _HumanMessage = HumanMessage
 
+    # ★ 加载 MCP 工具（从全局单例读取，由 main() 提前加载）
+    try:
+        from tools.mcp_loader import mcp_manager
+        mcp_tools = mcp_manager.tools
+    except Exception as e:
+        print(f"  {_A['d']}[MCP] 加载跳过: {e}{_A['0']}")
+        mcp_tools = []
+
     # 主 Agent：全能（所有工具）
     MAIN_TOOLS[:] = [get_weather, get_current_time, web_search, web_fetch,
                      rag_search, add_knowledge, read_file, list_dir,
@@ -104,7 +136,13 @@ def _build_tools():
                       write_file, edit_file, run_command]
     # Planner：搜索 + 知识库（深度研究/规划任务）
     PLANNER_TOOLS[:] = [web_search, web_fetch, rag_search, add_knowledge]
+    # MCP 工具自动分配给所有 Agent
+    if mcp_tools:
+        for tool_list in (MAIN_TOOLS, CODER_TOOLS, PLANNER_TOOLS):
+            tool_list.extend(mcp_tools)
     ALL_TOOLS[:] = MAIN_TOOLS + CODER_TOOLS + PLANNER_TOOLS
+    if mcp_tools:
+        pass  # MCP 工具已加载，静默
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,30 +215,52 @@ def _build_graph():
         model_name=cfg["id"],
         openai_api_key=cfg["key"],
         openai_api_base=cfg.get("base", ""),
+        request_timeout=120,  # 本地模型首次加载可能需要 1-2 分钟
     )
 
     # ── 构建单个子 Agent 的 StateGraph ──
-    def _make_sub_agent(tools, prompt_text):
+    def _make_sub_agent(bind_key: str, tools, prompt_text):
         """
         手动构建子 Agent 图：think → exec_tool 循环。
         系统指令在 think 时临时注入到消息列表（不保存到 state），
         兼容不支持 system 角色的模型（MiniMax 等）。
+
+        bind_key: _runtime 中存储 llm.bind_tools 结果的 key
+                  （"bind_chat" / "bind_coder" / "bind_planner"）
+                  闭包运行时从 _runtime[bind_key] 读取当前绑定的 LLM，
+                  这样换模型时不需要重建图。
         """
         # 工具名 → 工具对象映射
         tool_map = {t.name: t for t in tools}
-        tool_desc = "\n".join(f"- {t.name}: {t.description.split(chr(10))[0]}" for t in tools)
-        # 绑定工具到 LLM，让模型能生成结构化 tool_calls
-        llm_with_tools = llm.bind_tools(tools)
+        # 工具分类：内置 vs MCP（description 中带 [MCP:xxx] 前缀的是外部 MCP 工具）
+        builtin_desc = []
+        mcp_desc = []
+        for t in tools:
+            first_line = t.description.split('\n')[0] if t.description else ""
+            if first_line.startswith("[MCP:"):
+                mcp_desc.append(f"- {t.name}: {first_line}")
+            else:
+                builtin_desc.append(f"- {t.name}: {first_line}")
+        tool_desc_parts = []
+        if builtin_desc:
+            tool_desc_parts.append("【内置工具】\n" + "\n".join(builtin_desc))
+        if mcp_desc:
+            tool_desc_parts.append("【MCP 外部工具】（由外部 MCP 服务器提供，功能可能受限）\n" + "\n".join(mcp_desc))
+        tool_desc = "\n\n".join(tool_desc_parts)
+        # 首次绑定（后续热切换时由 _hot_swap_llm 更新）
+        _runtime[bind_key] = llm.bind_tools(tools)
 
         class SubState(TypedDict):
             messages: Annotated[list, add_messages]
 
         def think(state: SubState) -> dict:
+            # 运行时从 _runtime 读取当前绑定的 LLM（支持无感换模型）
+            bound_llm = _runtime[bind_key]
             msgs = list(state["messages"])
             # 构造系统指令（临时，不保存到 state）
-            sys_block = f"{prompt_text}\n\n## 可用工具\n{tool_desc}\n\n请根据上下文回答用户问题或调用工具。"
+            sys_block = f"{prompt_text}\n\n## 可用工具\n{tool_desc}"
             llm_input = [HumanMessage(content=sys_block)] + msgs
-            resp = llm_with_tools.invoke(llm_input)
+            resp = bound_llm.invoke(llm_input)
             return {"messages": [resp]}
 
         def route(state: SubState) -> str:
@@ -209,19 +269,41 @@ def _build_graph():
                 return "tools"
             return END
 
-        def exec_tools(state: SubState) -> dict:
+        async def exec_tools(state: SubState) -> dict:
+            import logging, asyncio
             last = state["messages"][-1]
             results = []
-            for tc in last.tool_calls:
-                t = tool_map.get(tc["name"])
-                if t:
-                    try:
-                        r = t.invoke(tc["args"])
-                        results.append(ToolMessage(content=str(r), tool_call_id=tc["id"]))
-                    except Exception as e:
-                        results.append(ToolMessage(content=f"工具执行错误: {e}", tool_call_id=tc["id"]))
-                else:
-                    results.append(ToolMessage(content=f"未知工具: {tc['name']}", tool_call_id=tc["id"]))
+            # 工具执行期间抑制日志输出，避免和 spinner 动画混在一起
+            _root_logger = logging.getLogger()
+            _tools_logger = logging.getLogger("tools")
+            _old_root = _root_logger.level
+            _old_tools = _tools_logger.level
+            _root_logger.setLevel(logging.CRITICAL)
+            _tools_logger.setLevel(logging.CRITICAL)
+            try:
+                for tc in last.tool_calls:
+                    t = tool_map.get(tc["name"])
+                    if t:
+                        try:
+                            _debug_log(f"[TOOL] 开始执行: {tc['name']}({tc['args']})")
+                            # MCP 工具可能挂住，加超时保护（60s）
+                            r = await asyncio.wait_for(t.ainvoke(tc["args"]), timeout=60)
+                            _debug_log(f"[TOOL] 执行完成: {tc['name']}, 返回类型: {type(r).__name__}")
+                            # MCP 工具返回 (content, artifact) 元组，需要解包
+                            if isinstance(r, tuple) and len(r) == 2:
+                                content, _artifact = r
+                                r = content
+                            results.append(ToolMessage(content=str(r), tool_call_id=tc["id"]))
+                        except asyncio.TimeoutError:
+                            results.append(ToolMessage(content=f"工具执行超时（60s）: {tc['name']}", tool_call_id=tc["id"]))
+                        except Exception as e:
+                            _debug_log(f"[TOOL] 执行错误: {tc['name']}: {e}")
+                            results.append(ToolMessage(content=f"工具执行错误: {e}", tool_call_id=tc["id"]))
+                    else:
+                        results.append(ToolMessage(content=f"未知工具: {tc['name']}", tool_call_id=tc["id"]))
+            finally:
+                _root_logger.setLevel(_old_root)
+                _tools_logger.setLevel(_old_tools)
             return {"messages": results}
 
         g = StateGraph(SubState)
@@ -266,14 +348,18 @@ def _build_graph():
 - 综合多个来源的信息给出分析，而非只引用一条"""
 
     # ── 创建 Agent ──
-    chat_agent = _make_sub_agent(MAIN_TOOLS, MAIN_PROMPT)
-    coder_agent = _make_sub_agent(CODER_TOOLS, CODER_PROMPT)
-    planner_agent = _make_sub_agent(PLANNER_TOOLS, PLANNER_PROMPT)
+    chat_agent = _make_sub_agent("bind_chat", MAIN_TOOLS, MAIN_PROMPT)
+    coder_agent = _make_sub_agent("bind_coder", CODER_TOOLS, CODER_PROMPT)
+    planner_agent = _make_sub_agent("bind_planner", PLANNER_TOOLS, PLANNER_PROMPT)
 
-    # ── 自定义 reducer：add_messages + 清理孤儿 tool_calls ──
+    # ── 自定义 reducer：add_messages + MicroCompact + 清理孤儿 tool_calls ──
+    from tools.context_manager import micro_compact
+
     def _safe_add_messages(existing, new):
         combined = add_messages(existing, new)
-        return _sanitize_messages(combined)
+        combined = _sanitize_messages(combined)
+        combined = micro_compact(combined)      # Layer 1: 清除旧工具输出
+        return combined
 
     # ── Supervisor 状态 ──
     class AgentState(TypedDict):
@@ -294,6 +380,8 @@ def _build_graph():
 
     def _supervisor(state: AgentState) -> dict:
         """Supervisor 路由节点：分析用户意图，决定分配给哪个 Agent"""
+        # 运行时从 _runtime 读取当前 LLM（支持无感换模型）
+        current_llm = _runtime["llm"]
         last = state["messages"][-1]
         content = getattr(last, "content", "") or str(last)
         if "[用户消息]" in content:
@@ -301,7 +389,7 @@ def _build_graph():
 
         try:
             # MiniMax 不支持 system 角色，合并到 HumanMessage
-            resp = llm.invoke([
+            resp = current_llm.invoke([
                 HumanMessage(content=f"{ROUTER_PROMPT}\n\n用户消息：{content}"),
             ])
             agent = resp.content.strip().lower()
@@ -333,13 +421,159 @@ def _build_graph():
     g.add_edge("coder", END)
     g.add_edge("planner", END)
 
-    return g, HumanMessage, ToolMessage
+    return g, HumanMessage, ToolMessage, llm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ⑤ 命令层：斜杠命令处理器
 # ══════════════════════════════════════════════════════════════════════════════
-async def _cmd(cmd: str, graph, mgr: SessionManager) -> bool:
+
+def _rebuild_graph_sync():
+    """同步重建图（在后台线程中调用）"""
+    try:
+        g, HM, TM, llm = _build_graph()
+        _runtime["graph"] = g
+        _runtime["HM"] = HM
+        _runtime["TM"] = TM
+        _runtime["llm"] = llm
+        _runtime["model_name"] = _model_registry.active_name
+        _runtime["bind_chat"] = llm.bind_tools(MAIN_TOOLS)
+        _runtime["bind_coder"] = llm.bind_tools(CODER_TOOLS)
+        _runtime["bind_planner"] = llm.bind_tools(PLANNER_TOOLS)
+        _runtime["error"] = None
+    except Exception as e:
+        _runtime["error"] = e
+    finally:
+        _runtime["ready"].set()
+
+
+async def _rebuild_graph():
+    """热切换模型后重建 Multi-Agent 图（不中断对话）"""
+    new_model = _model_registry.active_name
+    if new_model == _runtime.get("model_name"):
+        return  # 同一个模型，不需要重建
+
+    cfg = _model_registry.active_config
+    print(f"  {_A['d']}🔄 正在重建 Multi-Agent 图（{cfg['id']}）...{_A['0']}")
+    _runtime["ready"].clear()
+    t = threading.Thread(target=_rebuild_graph_sync, daemon=True)
+    t.start()
+
+    # 等待重建完成（带 spinner）
+    start_spinner("Rebuilding")
+    _runtime["ready"].wait()
+    stop_spinner()
+
+    if _runtime["error"]:
+        print(f"  {_A['r']}✗ 重建失败: {_runtime['error']}{_A['0']}")
+        return
+
+    # 重新编译（带 checkpointer）
+    if _runtime["ck_ctx"] is not None:
+        g = _runtime["graph"]
+        _runtime["graph"] = g.compile(checkpointer=_runtime["ck_ctx"])
+
+    print(f"  {_A['g']}✅ Multi-Agent 图已重建，新对话立即生效{_A['0']}")
+
+
+def _is_ollama() -> bool:
+    """检测当前模型是否是 Ollama 本地模型"""
+    cfg = _model_registry.active_config
+    base = cfg.get("base", "")
+    return "localhost:11434" in base or "127.0.0.1:11434" in base
+
+
+# 预热防重入：后台加载 + _turn 同时触发时排队等
+_warmup_lock = threading.Lock()
+
+
+def _warmup_ollama(quiet: bool = False):
+    """Ollama 模型预热：确保模型已加载，避免对话请求挂死
+
+    Ollama 默认 keep_alive=5m，模型空闲后自动卸载。
+    本函数通过 Ollama 原生 API /api/chat 发一个极短请求来触发加载。
+    模型已在内存时 <1s 返回，成本可忽略。
+
+    防重入：如果后台预热正在进行，后到的调用等锁释放后再发请求
+    （此时模型已被前一次加载到内存，秒回）。
+
+    Args:
+        quiet: True 时不操作 spinner/打印（用于嵌入 _turn 的 Thinking 阶段）
+    """
+    import httpx
+
+    got = _warmup_lock.acquire(timeout=200)  # 等前面的预热完成
+    if not got:
+        return
+    try:
+        cfg = _model_registry.active_config
+        model_id = cfg.get("id", "")
+        base = cfg.get("base", "")
+        ollama_base = base.replace("/v1", "").rstrip("/")
+
+        if not quiet:
+            start_spinner("Loading Model")
+        t0 = time.time()
+        try:
+            resp = httpx.post(
+                f"{ollama_base}/api/chat",
+                json={
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "options": {"num_predict": 1},
+                },
+                timeout=180,
+            )
+            elapsed = time.time() - t0
+            if not quiet:
+                stop_spinner()
+                if resp.status_code == 200:
+                    print(f"  {_A['g']}✅ 模型已就绪{_A['0']} {_A['d']}({elapsed:.1f}s){_A['0']}")
+                else:
+                    print(f"  {_A['y']}⚠ Ollama 返回 {resp.status_code}，继续尝试...{_A['0']}")
+        except httpx.TimeoutException:
+            if not quiet:
+                stop_spinner()
+            elapsed = time.time() - t0
+            print(f"\n  {_A['r']}✗ 模型加载超时（{elapsed:.0f}s），请检查 Ollama 状态{_A['0']}")
+            print(f"  {_A['d']}提示: 运行 ollama ps 查看模型状态{_A['0']}")
+            raise RuntimeError(f"Ollama 模型 {model_id} 加载超时")
+        except Exception as e:
+            if not quiet:
+                stop_spinner()
+            print(f"  {_A['y']}⚠ 预热失败: {e}，继续尝试...{_A['0']}")
+    finally:
+        _warmup_lock.release()
+
+
+def _hot_swap_llm():
+    """无感换模型：只替换 LLM 引用，不重建图
+
+    原理：图的闭包运行时从 _runtime["bind_*"] 读取当前 LLM，
+    所以只需更新 _runtime 中的引用，图结构完全不变。
+    耗时 < 1ms（只有对象创建 + 本地 bind_tools）。
+    """
+    from langchain_openai import ChatOpenAI
+
+    cfg = _model_registry.active_config
+    new_llm = ChatOpenAI(
+        model_name=cfg["id"],
+        openai_api_key=cfg["key"],
+        openai_api_base=cfg.get("base", ""),
+        request_timeout=120,  # 本地模型首次加载可能需要 1-2 分钟
+    )
+
+    # 更新 LLM 引用 + 重新绑定工具
+    _runtime["llm"] = new_llm
+    _runtime["bind_chat"] = new_llm.bind_tools(MAIN_TOOLS)
+    _runtime["bind_coder"] = new_llm.bind_tools(CODER_TOOLS)
+    _runtime["bind_planner"] = new_llm.bind_tools(PLANNER_TOOLS)
+    _runtime["model_name"] = _model_registry.active_name
+
+
+
+async def _cmd(cmd: str, mgr: SessionManager) -> bool:
     """斜杠命令分发：/help /sessions /new /switch /rename /delete /quit"""
     p = cmd.strip().split(maxsplit=1)
     a, arg = p[0].lower(), (p[1].strip() if len(p) > 1 else "")
@@ -352,7 +586,13 @@ async def _cmd(cmd: str, graph, mgr: SessionManager) -> bool:
         print(f"  {_A['g']}/rename <名称>{_A['0']}             重命名当前会话")
         print(f"  {_A['g']}/delete <序号>{_A['0']}           删除指定会话")
         print(f"  {_A['g']}/models{_A['0']}                  查看已配置模型列表")
-        print(f"  {_A['g']}/models <名称|序号>{_A['0']}       切换模型（需重启生效）")
+        print(f"  {_A['g']}/models <名称|序号>{_A['0']}       切换模型（热切换，无需重启）")
+        print(f"  {_A['g']}/mcp{_A['0']}                     查看 MCP 服务器状态")
+        print(f"  {_A['g']}/mcp reload{_A['0']}              热重载 MCP 配置（自动重建图）")
+        print(f"  {_A['g']}/mcp add <JSON>{_A['0']}          添加 MCP 服务器")
+        print(f"  {_A['g']}/mcp remove <名称>{_A['0']}       删除 MCP 服务器")
+        print(f"  {_A['g']}/context{_A['0']}                查看当前上下文状态（消息数/token 估算）")
+        print(f"  {_A['g']}/compact{_A['0']}               手动压缩上下文（LLM 摘要旧消息）")
         print(f"  {_A['g']}/quit{_A['0']} / {_A['g']}/q{_A['0']}             退出程序\n")
         return False
 
@@ -396,17 +636,140 @@ async def _cmd(cmd: str, graph, mgr: SessionManager) -> bool:
                 base_short = cfg.get("base", "").replace("https://", "").replace("http://", "").split("/")[0]
                 print(f"  {marker} {i}. {_A['c']}{name}{_A['0']} — {cfg['id']}")
                 print(f"       {base_short}")
-            print(f"\n  当前: {_A['g']}{active}{_A['0']} | 切换: {_A['g']}/models <名称|序号>{_A['0']}")
-            print(f"  {_A['y']}⚠ Multi-Agent 模式下切换模型需要重启{_A['0']}\n")
+            print(f"\n  当前: {_A['g']}{active}{_A['0']} | 切换: {_A['g']}/models <名称|序号>{_A['0']}\n")
             return False
-        # 切换模型（Multi-Agent 下需重启，但先更新注册表和 .env）
+        # 切换模型 → 热切换（无感，< 1ms）
         try:
             old, new = _model_registry.switch(arg)
             cfg = _model_registry.active_config
-            print(f"\n  ✅ 模型注册已切换: {_A['y']}{old}{_A['0']} → {_A['g']}{new}{_A['0']} ({cfg['id']})")
-            print(f"  {_A['y']}⚠ 请重启 Agent 以应用新的 Multi-Agent 图{_A['0']}\n")
+            _hot_swap_llm()
+            print(f"\n  ✅ 模型已切换: {_A['y']}{old}{_A['0']} → {_A['g']}{new}{_A['0']} ({cfg['id']})")
+            if _is_ollama():
+                # 本地模型后台静默加载，不阻塞用户
+                threading.Thread(target=_warmup_ollama, kwargs={"quiet": True}, daemon=True).start()
+                print(f"  {_A['d']}（本地模型后台加载中，首次提问会等待加载完成）{_A['0']}\n")
+            else:
+                print(f"  {_A['d']}（已热加载，新对话立即生效）{_A['0']}\n")
         except ValueError as e:
             print(f"\n  ✗ {e}\n")
+        return False
+
+    # ── /mcp 命令 — MCP 服务器管理 ──
+    if a == "/mcp":
+        from tools.mcp_loader import mcp_manager
+
+        if not arg or arg == "status":
+            # /mcp 或 /mcp status — 显示状态
+            print(f"\n{mcp_manager.get_status()}\n")
+            return False
+
+        if arg == "reload":
+            # /mcp reload — 热重载
+            start_spinner("MCP Reloading")
+            await mcp_manager.reload()
+            stop_spinner()
+            if mcp_manager.is_active:
+                print(f"\n  {_A['g']}✅ MCP 已重载: {len(mcp_manager.tools)} 个工具{_A['0']}")
+                # MCP 工具变了，需要重建图（bind_tools 需要新的工具列表）
+                await _rebuild_graph()
+            else:
+                print(f"\n  {_A['y']}⚠ MCP 无活跃连接（检查 mcp_servers.json 配置）{_A['0']}")
+            print()
+            return False
+
+        if arg.startswith("add "):
+            # /mcp add <JSON> — 添加 MCP 服务器
+            # 格式: /mcp add {"name": "playwright", "command": "npx", "args": ["@playwright/mcp@latest"], "transport": "stdio"}
+            # 或: /mcp add playwright {"command": "npx", "args": ["@playwright/mcp@latest"], "transport": "stdio"}
+            import json as _json
+            add_arg = arg[4:].strip()
+            try:
+                # 尝试解析为: name {"config": "..."}
+                parts = add_arg.split(None, 1)
+                if len(parts) == 2 and parts[1].startswith("{"):
+                    srv_name = parts[0]
+                    srv_config = _json.loads(parts[1])
+                else:
+                    # 解析为完整 JSON: {"name": "...", "command": "...", ...}
+                    data = _json.loads(add_arg)
+                    srv_name = data.pop("name", None)
+                    if not srv_name:
+                        print(f"\n  {_A['r']}✗ 缺少服务器名称（添加 name 字段）{_A['0']}\n")
+                        return False
+                    srv_config = data
+                print(f"\n  {mcp_manager.add_server(srv_name, srv_config)}")
+                print(f"  {_A['d']}提示: 输入 /mcp reload 立即生效{_A['0']}\n")
+            except _json.JSONDecodeError as e:
+                print(f"\n  {_A['r']}✗ JSON 格式错误: {e}{_A['0']}")
+                print(f"  {_A['d']}用法: /mcp add playwright {{\"command\": \"npx\", \"args\": [\"@playwright/mcp@latest\"], \"transport\": \"stdio\"}}{_A['0']}\n")
+            return False
+
+        if arg.startswith("remove "):
+            # /mcp remove <名称>
+            srv_name = arg[7:].strip()
+            print(f"\n  {mcp_manager.remove_server(srv_name)}")
+            print(f"  {_A['d']}提示: 输入 /mcp reload 立即生效{_A['0']}\n")
+            return False
+
+        print(f"\n  {_A['y']}用法: /mcp [status|reload|add|remove]{_A['0']}\n")
+        return False
+
+    # ── /context — 查看当前上下文状态 ──
+    if a == "/context":
+        try:
+            from tools.context_manager import get_context_stats
+            ck = _runtime.get("ck")
+            if ck is None:
+                print(f"\n  {_A['y']}上下文尚未初始化（发一条消息后可用）{_A['0']}\n")
+                return False
+            tid = mgr.active_id
+            cfg_ctx = {"configurable": {"thread_id": tid}}
+            state = await _runtime["graph"].aget_state(cfg_ctx)
+            msgs = state.values.get("messages", [])
+            stats = get_context_stats(msgs)
+            print(f"\n  {_A['b']}{_A['c']}上下文状态:{_A['0']}")
+            print(f"  {'─' * 40}")
+            print(f"  消息总数:    {stats['total_messages']}")
+            print(f"  ├─ 用户消息: {stats['human_messages']}")
+            print(f"  ├─ AI 消息:  {stats['ai_messages']}")
+            print(f"  └─ 工具输出: {stats['tool_messages']}（已压缩 {stats['cleared_messages']}）")
+            est_tokens = stats['est_chars'] // 2  # 粗略估算：中文约 2 字符/token
+            print(f"  估算 token:  ~{est_tokens:,}")
+            # 会话记忆统计
+            try:
+                from tools.session_memory import session_memory as _sm
+                ms = _sm.get_stats(tid)
+                print(f"  会话记忆:    {ms['turn_count']} 轮 | "
+                      f"{ms['key_files']} 文件 | {ms['tools_used']} 工具 | "
+                      f"~{ms['memory_chars']} 字符")
+            except Exception:
+                pass
+            # 熔断器状态
+            try:
+                from tools.context_manager import get_circuit_status
+                cs = get_circuit_status()
+                if cs["is_open"]:
+                    print(f"  熔断器:      {_A['r']}⚠ 已断开（连续 {cs['consecutive_failures']} 次失败）{_A['0']}")
+                else:
+                    print(f"  熔断器:      {_A['g']}正常{_A['0']}（{cs['consecutive_failures']}/{cs['max_failures']}）")
+            except Exception:
+                pass
+            # 输出预算状态
+            try:
+                from tools.output_budget import get_budget_info
+                print(f"  输出预算:    {get_budget_info()}")
+            except Exception:
+                pass
+            print(f"  {'─' * 40}\n")
+        except Exception as e:
+            print(f"\n  {_A['y']}获取上下文失败: {e}{_A['0']}\n")
+        return False
+
+    # ── /compact — 手动压缩上下文（强制执行） ──
+    if a == "/compact":
+        compressed = await _auto_compact(mgr.active_id, force=True)
+        if not compressed:
+            print(f"\n  {_A['y']}压缩失败或无需压缩{_A['0']}\n")
         return False
 
     print(f"  {_A['r']}未知命令: {a}（输入 /help 查看帮助）{_A['0']}")
@@ -438,9 +801,10 @@ def _echo_user(text: str):
     print()
 
 
-async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessage):
+async def _turn(user_input: str, thread_id: str):
     """单轮对话：Routing → 子Agent流式 → 工具动画 → 打印"""
     tp = rp = False
+    _reply_started = False
 
     _clear_input(user_input)
     _echo_user(user_input)
@@ -449,18 +813,80 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
     # 注入实时时间和工作目录
     from datetime import datetime
     _now = datetime.now().strftime('%Y-%m-%d %A %H:%M:%S')
-    _cwd = os.environ.get("LAUNCH_DIR", str(Path.cwd()))
+    _cwd = os.environ.get("LAUNCH_DIR", "") or str(Path.cwd())
     _env = ENV_BLOCK.replace("{current_time}", _now).replace("{cwd}", _cwd)
 
-    inp = {
-        "messages": [
-            HumanMessage(content=f"{_env}\n\n[用户消息]\n{user_input}"),
-        ],
-        "next_agent": "",
-    }
+    # 注入会话记忆（Layer 2：零成本自动追踪）
+    from tools.session_memory import session_memory
+    memory_block = session_memory.get_memory_block(thread_id)
+    parts = [_env]
+    if memory_block:
+        parts.append(memory_block)
+    parts.append(f"[用户消息]\n{user_input}")
+
     cfg = {"configurable": {"thread_id": thread_id}}
 
     try:
+        # 立即显示 Agent 标签 + Thinking 动画
+        # 后台加载 / checkpointer 编译 / 模型预热 / 推理 全部算在 Thinking 里
+        print(f"{_A['c']}Agent{_A['0']}")
+        start_spinner("Thinking")
+
+        # ★ 等待后台加载完成（首次启动时 graph 还是 None）
+        if not _runtime["ready"].is_set():
+            await asyncio.to_thread(_runtime["ready"].wait)
+            if _runtime["error"]:
+                stop_spinner()
+                print(f"  {_A['r']}启动失败: {_runtime['error']}{_A['0']}")
+                return
+
+        # ★ 首次编译：打开 checkpointer 并编译图
+        if _runtime["ck_ctx"] is None:
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+            db = Path(__file__).parent.parent / "chat_history.db"
+            ck_ctx = AsyncSqliteSaver.from_conn_string(str(db))
+            _runtime["ck"] = await ck_ctx.__aenter__()
+            _runtime["ck_ctx"] = ck_ctx
+            _runtime["graph"] = _runtime["graph"].compile(checkpointer=_runtime["ck"])
+
+        # 用最新的 graph + HM（首次编译后可能变了）
+        graph = _runtime["graph"]
+        HumanMessage = _runtime["HM"]
+
+        # ★ MCP 懒加载：首次对话时同步加载（算在 Thinking 里，静默）
+        if not _runtime.get("mcp_loaded"):
+            try:
+                from tools.mcp_loader import mcp_manager
+                if not mcp_manager.is_active:
+                    await mcp_manager.load()
+                if mcp_manager.is_active:
+                    _build_tools()
+                    _rebuild_graph_sync()
+                    if _runtime["ck_ctx"] is not None:
+                        _runtime["graph"] = _runtime["graph"].compile(checkpointer=_runtime["ck"])
+                    graph = _runtime["graph"]
+            except Exception:
+                pass
+            finally:
+                _runtime["mcp_loaded"] = True
+
+        # ★ Ollama 预热：确保模型已加载（时间算在 Thinking 里，用户无感）
+        if _is_ollama():
+            try:
+                await asyncio.to_thread(_warmup_ollama, quiet=True)
+            except RuntimeError:
+                stop_spinner()
+                print(f"  {_A['r']}✗ 模型加载失败，请检查 Ollama 状态{_A['0']}")
+                return
+
+        # 构造输入消息（HumanMessage 在 ready 之后才有）
+        inp = {
+            "messages": [
+                HumanMessage(content="\n\n".join(parts)),
+            ],
+            "next_agent": "",
+        }
+
         _phase = "supervisor"  # supervisor | agent | tool
         async for ev in graph.astream_events(inp, config=cfg, version="v2"):
             if _interrupt.is_set(): raise KeyboardInterrupt("打断")
@@ -477,13 +903,14 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
                     ckpt_ns = ev.get("metadata", {}).get("checkpoint_ns", "")
                     sub_name = ckpt_ns.split(":")[0] if ckpt_ns else node
                     agent_label = _AGENT_NAMES.get(sub_name, sub_name.title())
-                    stop_spinner()
-                    # 主Agent(chat) 直接显示 Agent，子Agent 显示 Agent | Coder/Planner
-                    if sub_name == "chat":
-                        print(f"{_A['c']}Agent{_A['0']}\n")
-                    else:
-                        print(f"{_A['c']}Agent{_A['0']} {_A['d']}|{_A['0']} {_A['c']}{agent_label}{_A['0']}\n")
-                    start_spinner("Thinking")
+                    # 子 Agent（Coder/Planner）：上移覆盖 Agent 行，改为 Agent | Label
+                    if sub_name != "chat":
+                        stop_spinner()
+                        # stop_spinner 输出了 "  ● Thinking（Xs）\n" 占 1 行
+                        # cursor 在 Agent 下面第 2 行，需要上移 2 行才能覆盖 Agent
+                        sys.stdout.write(f"\033[2A\r\033[K{_A['c']}Agent {_A['d']}| {agent_label}{_A['0']}\033[1B\n")
+                        sys.stdout.flush()
+                        start_spinner("Thinking")
 
             # ── LLM 结束（提取 token） ──
             elif et == "on_chat_model_end":
@@ -512,13 +939,17 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
                     if is_t:
                         if not tp:
                             stop_spinner(); tp = True
-                            sys.stdout.write(_A["gr"]); sys.stdout.flush()
+                            sys.stdout.write(f"    {_A['d']}{_A['gr']}"); sys.stdout.flush()
                         type_text(text.replace("\n", "\n    "), 0.03)
                     else:
                         if not rp:
                             stop_spinner()
                             if tp: sys.stdout.write(_A["0"]); print()
                             rp = True
+                        # 首次正式回复写缩进，后续靠 \n 替换自动缩进
+                        if not _reply_started:
+                            sys.stdout.write("    "); sys.stdout.flush()
+                            _reply_started = True
                         type_text(text.replace("\n", "\n    "), 0.025)
 
             # ── 工具调用开始 ──
@@ -526,7 +957,9 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
                 nm = ev.get("name", "unknown")
                 inp2 = ev.get("data", {}).get("input", {})
                 params = "，".join(
-                    f'{k}="{v}"' if isinstance(v, str) else f'{k}={v}'
+                    f'{k}="{v[0]}"' if isinstance(v, list) and len(v) == 1
+                    else f'{k}="{v}"' if isinstance(v, str)
+                    else f'{k}={v}'
                     for k, v in inp2.items()
                 ) if inp2 else ""
                 info = f"{nm}（{params}）" if params else nm
@@ -535,7 +968,7 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
             # ── 工具调用结束 ──
             elif et == "on_tool_end":
                 stop_spinner()
-                tp = rp = False
+                tp = False
                 parser = StreamParser()
 
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -546,13 +979,14 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
     # 刷出剩余内容
     for is_t, text in parser.done():
         if is_t:
-            if not tp: stop_spinner(); tp = True; sys.stdout.write(f"{_A['d']}{_A['gr']}"); sys.stdout.flush()
+            if not tp: stop_spinner(); tp = True; sys.stdout.write(f"    {_A['d']}{_A['gr']}"); sys.stdout.flush()
             type_text(text.replace("\n", "\n    "), 0.03)
         else:
             if not rp:
                 stop_spinner()
                 if tp: sys.stdout.write(_A["0"]); print()
                 rp = True
+            sys.stdout.write("    "); sys.stdout.flush()
             type_text(text.replace("\n", "\n    "), 0.025)
 
     if not tp and not rp: stop_spinner(); print("  (无回复)")
@@ -562,7 +996,128 @@ async def _turn(graph, user_input: str, thread_id: str, HumanMessage, ToolMessag
 # ══════════════════════════════════════════════════════════════════════════════
 # ⑦ 入口层：主程序（Banner 先行，重型导入后台加载）
 # ══════════════════════════════════════════════════════════════════════════════
-async def run_chat_loop(graph, mgr: SessionManager, HumanMessage, ToolMessage):
+
+async def _track_memory(thread_id: str):
+    """对话结束后更新会话记忆（Layer 2：零成本自动追踪）"""
+    try:
+        from tools.session_memory import session_memory
+        cfg = {"configurable": {"thread_id": thread_id}}
+        state = await _runtime["graph"].aget_state(cfg)
+        msgs = state.values.get("messages", [])
+        # 只传最近 8 条消息，避免重复处理
+        session_memory.track_from_messages(thread_id, msgs[-8:])
+    except Exception:
+        pass  # 记忆追踪失败不影响主流程
+
+
+async def _auto_compact(thread_id: str, *, force: bool = False) -> bool:
+    """自动检测上下文大小，超过阈值时触发 Layer 3 摘要压缩
+
+    Args:
+        force: 为 True 时跳过阈值检查，强制压缩（供 /compact 命令使用）
+
+    Returns:
+        True 表示执行了压缩
+    """
+    from tools.context_manager import (
+        get_context_stats, COMPACT_THRESHOLD,
+        is_compact_circuit_open, record_compact_failure, record_compact_success,
+    )
+    from langgraph.graph.message import add_messages
+
+    # 熔断器检查（强制模式跳过）
+    if not force and is_compact_circuit_open():
+        return False
+
+    # 冷却：距离上次成功压缩不足 3 轮时跳过（避免无限压缩循环）
+    if not force:
+        _compact_cooldown[0] -= 1
+        if _compact_cooldown[0] > 0:
+            return False
+
+    try:
+        graph = _runtime["graph"]
+        # 确保图已编译（未编译的 StateGraph 没有 aget_state）
+        if not hasattr(graph, 'aget_state'):
+            _debug_log("[COMPACT] 图未编译，跳过")
+            return False
+        cfg = {"configurable": {"thread_id": thread_id}}
+        state = await graph.aget_state(cfg)
+        msgs = state.values.get("messages", [])
+        if not msgs:
+            return False
+
+        stats = get_context_stats(msgs)
+        est_tokens = stats["est_chars"] // 2
+
+        # 低于阈值，不需要压缩（强制模式跳过）
+        if not force and est_tokens < COMPACT_THRESHOLD:
+            return False
+
+        # 需要压缩
+        print(f"  {_A['y']}⏳ 上下文 ~{est_tokens:,} tokens，正在压缩...{_A['0']}")
+        start_spinner("Compacting")
+
+        from tools.context_manager import summarize_and_compact
+        llm = _runtime.get("llm")
+        if not llm:
+            stop_spinner()
+            return False
+
+        compressed, summary = await summarize_and_compact(msgs, llm)
+
+        stop_spinner()
+
+        if summary is None:
+            record_compact_failure()
+            return False
+
+        # 用 LangGraph 的 state update 替换消息
+        # 策略：逐条删除，跳过 checkpoint 中不存在的 ID
+        from langgraph.graph.message import RemoveMessage
+        remove_ops = [RemoveMessage(id=m.id) for m in msgs if getattr(m, 'id', None)]
+        _debug_log(f"[COMPACT] 尝试删除 {len(remove_ops)} 条消息")
+        try:
+            await graph.aupdate_state(cfg, {"messages": remove_ops})
+        except Exception as del_err:
+            # 如果批量删除失败（某些 ID 不存在于 checkpoint），逐条尝试
+            _debug_log(f"[COMPACT] 批量删除失败: {del_err}，改为逐条删除")
+            for op in remove_ops:
+                try:
+                    await graph.aupdate_state(cfg, {"messages": [op]})
+                except Exception:
+                    _debug_log(f"[COMPACT] 跳过无效 ID: {op.id}")
+        await graph.aupdate_state(cfg, {"messages": compressed})
+
+        # Step 4: 压缩后重建 — 重新注入近期文件上下文
+        try:
+            from tools.session_memory import session_memory as _sm
+            file_context = _sm.get_recent_file_context(thread_id)
+            if file_context:
+                from langchain_core.messages import HumanMessage as _HM
+                ctx_msg = _HM(content=f"[压缩恢复 — 近期文件上下文]\n\n{file_context}")
+                await graph.aupdate_state(cfg, {"messages": [ctx_msg]})
+        except Exception:
+            pass  # 文件重建失败不影响主流程
+
+        new_stats = get_context_stats(compressed)
+        new_tokens = new_stats["est_chars"] // 2
+        saved_pct = (1 - new_stats["est_chars"] / max(stats["est_chars"], 1)) * 100
+
+        record_compact_success()
+        _compact_cooldown[0] = 3  # 成功后冷却 3 轮
+        print(f"  {_A['g']}✅ 压缩完成：{stats['total_messages']} → {new_stats['total_messages']} 条消息 "
+              f"| ~{est_tokens:,} → ~{new_tokens:,} tokens（节省 {saved_pct:.0f}%）{_A['0']}")
+        return True
+
+    except Exception as e:
+        stop_spinner()
+        record_compact_failure()
+        print(f"  {_A['y']}⚠ 压缩失败: {e}{_A['0']}")
+        return False
+
+
+async def run_chat_loop(mgr: SessionManager):
     while True:
         try:
             ui = input(f"\r{_A['g']}> {_A['0']}").strip()
@@ -572,10 +1127,12 @@ async def run_chat_loop(graph, mgr: SessionManager, HumanMessage, ToolMessage):
         if not ui:
             continue
         if ui.startswith("/"):
-            if await _cmd(ui, graph, mgr): print(f"{_A['c']}再见！👋{_A['0']}"); break
+            if await _cmd(ui, mgr): print(f"{_A['c']}再见！👋{_A['0']}"); break
             continue
-        await _turn(graph, ui, mgr.active_id, HumanMessage, ToolMessage)
+        await _auto_compact(mgr.active_id)
+        await _turn(ui, mgr.active_id)
         mgr.touch()
+        await _track_memory(mgr.active_id)
 
 async def main():
     # Banner
@@ -585,24 +1142,30 @@ async def main():
     _actual_cwd = str(Path.cwd())
     _display_cwd = _launch_dir or _actual_cwd
     print(f"\n╔{'═' * 50}╗")
-    print(f"║  🤖 {_A['b']}My Agent — 2.0.0{_A['0']} (Multi-Agent){' ' * 19}║")
+    print(f"║  🤖 {_A['b']}My Agent — 2.0.0{_A['0']} (Multi-Agent){' ' * 15}║")
     print(f"╚{'═' * 50}╝")
     print(f"  📡 {_A['c']}{mn}{_A['0']} · {mid}")
     print(f"  📂 {_A['d']}{_display_cwd}{_A['0']}")
-    print(f"  🏗️  {_A['d']}Supervisor → chat(全能) / coder / planner{_A['0']}\n")
+
+    # ★ MCP 懒加载在 _turn() 内部（首次 Thinking 时同步加载）
+
+    print()
 
     # 后台静默加载重型模块
-    _ready = threading.Event()
-    _graph_data = [None]
-    _load_error = [None]
+    _runtime["ready"].clear()
 
     def _background_load():
         try:
-            _graph_data[0] = _build_graph()
+            g, HM, TM, llm = _build_graph()
+            _runtime["graph"] = g
+            _runtime["HM"] = HM
+            _runtime["TM"] = TM
+            _runtime["llm"] = llm
+            _runtime["model_name"] = _model_registry.active_name
         except Exception as e:
-            _load_error[0] = e
+            _runtime["error"] = e
         finally:
-            _ready.set()
+            _runtime["ready"].set()
 
     threading.Thread(target=_background_load, daemon=True).start()
 
@@ -617,42 +1180,17 @@ async def main():
     print()
 
     # 主循环
-    while True:
-        try:
-            ui = input(f"\r{_A['g']}> {_A['0']}").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n{_A['c']}再见！👋{_A['0']}")
-            break
-        if not ui:
-            continue
+    await run_chat_loop(mgr)
 
-        if ui.startswith("/"):
-            if await _cmd(ui, None, mgr):
-                print(f"{_A['c']}再见！👋{_A['0']}")
-                break
-            continue
-
-        # 首次发送：等待后台加载完成
-        if not _ready.is_set():
-            start_spinner("Starting")
-            _ready.wait()
-            stop_spinner()
-
-        if _load_error[0]:
-            print(f"\n  [{_A['r']}启动失败: {_load_error[0]}{_A['0']}]")
-            return
-
-        # 编译图 + 打开持久化
-        g, HM, TM = _graph_data[0]
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-        db = Path(__file__).parent.parent / "chat_history.db"
-
-        async with AsyncSqliteSaver.from_conn_string(str(db)) as ck:
-            graph = g.compile(checkpointer=ck)
-            await _turn(graph, ui, mgr.active_id, HM, TM)
-            mgr.touch()
-            await run_chat_loop(graph, mgr, HM, TM)
-        break
+    # 清理
+    if _runtime["ck_ctx"] is not None:
+        await _runtime["ck_ctx"].__aexit__(None, None, None)
+    # 清理 MCP 连接
+    try:
+        from tools.mcp_loader import mcp_manager
+        await mcp_manager._close()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     asyncio.run(main())

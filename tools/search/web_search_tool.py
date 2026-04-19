@@ -48,4 +48,7 @@ def web_search(query: str) -> str:
         lines.append(f"    URL: {r.url}")
         lines.append("")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+
+    from tools.output_budget import truncate_output
+    return truncate_output("web_search", result)

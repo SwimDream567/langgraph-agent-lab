@@ -88,4 +88,7 @@ def web_fetch(urls: list[str]) -> str:
     for url in urls:
         results.append(_fetch_one(url))
 
-    return "\n\n---\n\n".join(results)
+    result = "\n\n---\n\n".join(results)
+
+    from tools.output_budget import truncate_output
+    return truncate_output("web_fetch", result)

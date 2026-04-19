@@ -16,7 +16,7 @@ from langchain_core.tools import tool
 # ── 安全边界 ──────────────────────────────────────────────────────────────────
 # 禁止访问的目录（系统关键路径）
 _BLOCKED = {
-    r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x860",
+    r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)",
     r"C:\ProgramData",
 }
 # 单次读取最大行数（防止撑爆上下文）
@@ -90,7 +90,13 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
         if end < total:
             body += f"\n... 还有 {total - end} 行未显示（用 offset={end+1} 继续读）"
 
-        return header + body
+        result = header + body
+
+        # 字符数截断（固定上限 + 感知提示）
+        from tools.output_budget import truncate_output
+        result = truncate_output("read_file", result)
+
+        return result
 
     except ValueError as e:
         return str(e)
@@ -173,7 +179,11 @@ def list_dir(path: str, pattern: str = "*", recursive: bool = False) -> str:
             lines = lines[:MAX_SEARCH_RESULTS]
             lines.append(f"\n  ... 共 {len(entries)} 项，只显示前 {MAX_SEARCH_RESULTS} 项")
 
-        return header + "\n".join(lines)
+        result = header + "\n".join(lines)
+
+        # 字符级截断
+        from tools.output_budget import truncate_output
+        return truncate_output("list_dir", result)
 
     except ValueError as e:
         return str(e)
@@ -228,7 +238,10 @@ def search_file(path: str, pattern: str) -> str:
         if len(matches) > MAX_SEARCH_RESULTS:
             lines.append(f"\n  ... 共 {len(matches)} 个，只显示前 {MAX_SEARCH_RESULTS} 个")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+
+        from tools.output_budget import truncate_output
+        return truncate_output("search_file", result)
 
     except ValueError as e:
         return str(e)
@@ -327,9 +340,9 @@ def search_content(path: str, pattern: str, file_glob: str = "*", context: int =
         lines.append(f"\n共 {total_matches} 处匹配")
 
         output = "\n".join(lines)
-        # 截断过长输出
-        if len(output) > 8000:
-            output = output[:8000] + "\n\n... 结果过长，已截断"
+        # 固定上限截断 + 感知提示
+        from tools.output_budget import truncate_output
+        output = truncate_output("search_content", output)
 
         return output
 

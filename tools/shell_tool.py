@@ -80,23 +80,16 @@ def run_command(command: str, cwd: str = "", timeout: int = DEFAULT_TIMEOUT) -> 
 
         output = "\n".join(output_parts) if output_parts else "(无输出)"
 
-        # 截断过长输出
-        truncated = False
-        if len(output) > MAX_OUTPUT:
-            output = output[:MAX_OUTPUT]
-            truncated = True
-
         # 格式化返回
         header = f"📦 命令: {command}\n"
         header += f"   目录: {work_dir} | 耗时: ≤{timeout}s | 退出码: {result.returncode}\n"
         header += "─" * 50 + "\n"
 
-        if truncated:
-            footer = f"\n... 输出过长，已截断（共 {len(output)} 字符）"
-        else:
-            footer = ""
+        full_output = header + output
 
-        return header + output + footer
+        # 统一截断
+        from tools.output_budget import truncate_output
+        return truncate_output("run_command", full_output)
 
     except subprocess.TimeoutExpired:
         return f"⏰ 命令超时（{timeout}s）: {command}\n进程已终止。"

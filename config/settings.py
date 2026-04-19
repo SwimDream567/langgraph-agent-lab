@@ -6,6 +6,10 @@
   MODEL_<名称>_BASE=https://...     ← API Base URL
   MODEL_<名称>_ID=model-name        ← 模型ID
 
+同供应商多模型（继承，避免重复写 KEY/BASE）:
+  MODEL_<名称>_INHERIT=基础模型名    ← 从哪个模型继承 KEY/BASE
+  MODEL_<名称>_ID=model-name        ← 只写不同的 ID 即可
+
 切模型：改 .env 的 ACTIVE_MODEL，或用 /models 命令运行时切换
 加模型：在 .env 照格式加三行 MODEL_<名称>_{KEY,BASE,ID}，重启生效
 """
@@ -36,9 +40,11 @@ def _parse_models() -> dict:
     """从环境变量解析所有模型配置
 
     格式: MODEL_<NAME>_KEY / MODEL_<NAME>_BASE / MODEL_<NAME>_ID
+    继承: MODEL_<NAME>_INHERIT=<基础模型名>  自动复制 KEY/BASE
     返回: {name: {key, base, id}, ...}
     """
     models = {}
+    inherits = {}  # {name: base_name} 收集继承关系
     for key, value in os.environ.items():
         if not key.startswith("MODEL_") or not value:
             continue
@@ -48,11 +54,23 @@ def _parse_models() -> dict:
             continue
         name = parts[:idx].lower()
         field = parts[idx + 1:].lower()
+        if field == "inherit":
+            inherits[name] = value.strip().lower()
+            continue
         if field not in ("key", "base", "id"):
             continue
         if name not in models:
             models[name] = {}
         models[name][field] = value
+
+    # 处理继承：从基础模型复制缺失的 key/base
+    for name, base_name in inherits.items():
+        if name not in models:
+            models[name] = {}
+        if base_name in models:
+            for field in ("key", "base"):
+                if field not in models[name] and field in models[base_name]:
+                    models[name][field] = models[base_name][field]
 
     # 至少需要 KEY + ID 才算有效
     models = {k: v for k, v in models.items()
