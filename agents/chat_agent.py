@@ -78,8 +78,9 @@ _AGENT_NAMES = {"chat": "Agent", "coder": "Coder", "planner": "Planner"}
 def _get_env_block():
     """生成环境信息块（cwd/time 在 _turn 里动态替换）"""
     home = str(Path.home())
+    _sys = {"win32": "Windows", "darwin": "macOS", "linux": "Linux"}.get(sys.platform, sys.platform)
     return f"""## 运行环境
-- 系统：Windows
+- 系统：{_sys}
 - 主目录：{home}
 - 当前工作目录：{{cwd}}
 - 当前时间：{{current_time}}"""
