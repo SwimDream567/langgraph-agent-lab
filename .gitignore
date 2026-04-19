@@ -47,6 +47,14 @@ chat_history.db
 chat_history.db-shm
 chat_history.db-wal
 sessions.json
+chat_history_memory/
+
+# MCP 配置（可能含本地路径，不通用）
+.mcp.json
+
+# Playwright 输出目录（截图/日志）
+playwright-output/
+.playwright-mcp/
 
 # 启动脚本（本地路径，不通用）
 run_chat_agent.bat

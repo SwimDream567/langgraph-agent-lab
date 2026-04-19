@@ -201,7 +201,7 @@ from tools.rag_tool import rag_search, ingest
 ingest("D:/MyDocs/wiki")
 
 # 第二步：检索（向量 + BM25 + RRF 融合）
-result = rag_search("游梦的技术栈是什么？")
+result = rag_search("用户的技术栈是什么？")
 ```
 
 ### 联网搜索

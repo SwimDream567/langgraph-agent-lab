@@ -29,11 +29,11 @@ def _log(*args, **kw):
 
 用法：
   # 方式1：命令行入库（独立步骤）
-  python -m tools.rag_tool --ingest D:\\MyObsidian\\MyObsidian\\wiki
+  python -m tools.rag_tool --ingest /path/to/knowledge/base
 
   # 方式2：代码调用
   from tools.rag_tool import rag_search
-  result = rag_search("游梦的技术栈是什么？")
+  result = rag_search("用户的技术栈是什么？")
 """
 
 import os
@@ -49,8 +49,8 @@ import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import HF_EMBED_MODEL
 
-# 默认知识库路径
-DEFAULT_KB_PATH = r"D:\MyObsidian\MyObsidian\wiki"
+# 默认知识库路径（可通过环境变量 KB_PATH 覆盖）
+DEFAULT_KB_PATH = os.environ.get("KB_PATH", "")
 
 # 支持的文件扩展名
 SUPPORTED_EXTENSIONS = {
@@ -622,7 +622,7 @@ def _hybrid_search(query: str, top_k: int = 4):
 
 @tool
 def rag_search(query: str) -> str:
-    """搜索现有知识库（默认是游梦的Obsidian）。当用户问到关于游梦的个人信息、简历、项目经历、技术栈时调用。
+    """搜索本地知识库，查找与用户问题相关的文档内容。适用于需要参考已有资料回答问题的场景。
     """
     results = _hybrid_search(query, top_k=4)
 
@@ -636,7 +636,9 @@ def rag_search(query: str) -> str:
 
     result = "\n\n".join(lines)
     _log(f"[RAG] 混合检索「{query}」→ 召回 {len(results)} 个文档块 (向量+BM25+RRF)")
-    return result
+
+    from tools.output_budget import truncate_output
+    return truncate_output("rag_search", result)
 
 
 @tool
@@ -655,9 +657,8 @@ def create_rag_tool():
     from langchain_core.tools import Tool
 
     description = (
-        "当用户问到关于游梦的简历、项目经历、技术栈、工作经验、"
-        "学习计划、求职意向等个人相关的问题时，先调用这个工具搜索"
-        " Obsidian 知识库获取相关信息，再回答。不要自己编造答案。"
+        "当用户提出的问题可能需要参考已有文档或资料时，"
+        "先调用这个工具搜索知识库获取相关内容，再回答。不要自己编造答案。"
     )
 
     return Tool(
@@ -691,8 +692,8 @@ if __name__ == "__main__":
     else:
         # 默认测试
         test_questions = [
-            "游梦的技术栈是什么？",
-            "他的 GPA 是多少？",
+            "用户的技术栈是什么？",
+            "知识库里有关于项目经历的信息吗？",
             "今天天气怎么样？",
         ]
         print("=" * 50)
