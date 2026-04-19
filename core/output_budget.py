@@ -10,7 +10,7 @@
   agent 能感知到截断，主动补读。
 
 使用方式：
-  from tools.output_budget import truncate_output
+  from core.output_budget import truncate_output
   result = truncate_output("read_file", raw_output)
 
 配置（.env）：

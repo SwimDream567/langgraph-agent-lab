@@ -50,5 +50,5 @@ def web_search(query: str) -> str:
 
     result = "\n".join(lines)
 
-    from tools.output_budget import truncate_output
+    from core.output_budget import truncate_output
     return truncate_output("web_search", result)

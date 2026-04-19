@@ -8,7 +8,7 @@
   - 使用持久 session（工具调用复用同一连接，浏览器不会关闭）
 
 使用：
-  from tools.mcp_loader import MCPManager, CONFIG_PATH
+  from core.mcp_loader import MCPManager, CONFIG_PATH
 
   mgr = MCPManager()
   await mgr.load()           # 连接所有 MCP 服务器
