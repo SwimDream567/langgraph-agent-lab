@@ -90,5 +90,5 @@ def web_fetch(urls: list[str]) -> str:
 
     result = "\n\n---\n\n".join(results)
 
-    from tools.output_budget import truncate_output
+    from core.output_budget import truncate_output
     return truncate_output("web_fetch", result)

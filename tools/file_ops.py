@@ -93,7 +93,7 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
         result = header + body
 
         # 字符数截断（固定上限 + 感知提示）
-        from tools.output_budget import truncate_output
+        from core.output_budget import truncate_output
         result = truncate_output("read_file", result)
 
         return result
@@ -182,7 +182,7 @@ def list_dir(path: str, pattern: str = "*", recursive: bool = False) -> str:
         result = header + "\n".join(lines)
 
         # 字符级截断
-        from tools.output_budget import truncate_output
+        from core.output_budget import truncate_output
         return truncate_output("list_dir", result)
 
     except ValueError as e:
@@ -240,7 +240,7 @@ def search_file(path: str, pattern: str) -> str:
 
         result = "\n".join(lines)
 
-        from tools.output_budget import truncate_output
+        from core.output_budget import truncate_output
         return truncate_output("search_file", result)
 
     except ValueError as e:
@@ -341,7 +341,7 @@ def search_content(path: str, pattern: str, file_glob: str = "*", context: int =
 
         output = "\n".join(lines)
         # 固定上限截断 + 感知提示
-        from tools.output_budget import truncate_output
+        from core.output_budget import truncate_output
         output = truncate_output("search_content", output)
 
         return output

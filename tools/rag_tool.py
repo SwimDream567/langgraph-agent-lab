@@ -637,7 +637,7 @@ def rag_search(query: str) -> str:
     result = "\n\n".join(lines)
     _log(f"[RAG] 混合检索「{query}」→ 召回 {len(results)} 个文档块 (向量+BM25+RRF)")
 
-    from tools.output_budget import truncate_output
+    from core.output_budget import truncate_output
     return truncate_output("rag_search", result)
 
 

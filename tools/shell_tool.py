@@ -88,7 +88,7 @@ def run_command(command: str, cwd: str = "", timeout: int = DEFAULT_TIMEOUT) -> 
         full_output = header + output
 
         # 统一截断
-        from tools.output_budget import truncate_output
+        from core.output_budget import truncate_output
         return truncate_output("run_command", full_output)
 
     except subprocess.TimeoutExpired:

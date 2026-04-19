@@ -74,8 +74,8 @@
 | **多 Agent** | Supervisor 模式 | 路由节点 + 子 Agent StateGraph |
 | **LLM** | MiniMax / 智谱 GLM / DeepSeek / 通义千问 / Ollama | OpenAI 兼容格式，`/models` 热切换 |
 | **多模型注册表** | ModelRegistry | 环境变量声明 + 继承配置 + 运行时切换 |
-| **上下文管理** | context_manager.py | L1 清除旧工具输出 → L2 会话记忆 → L3 LLM 摘要 |
-| **MCP** | mcp_loader.py | 读取 `.mcp.json`，持久 session + 热重载 |
+| **上下文管理** | core/context_manager.py | L1 清除旧工具输出 → L2 会话记忆 → L3 LLM 摘要 |
+| **MCP** | core/mcp_loader.py | 读取 `.mcp.json`，持久 session + 热重载 |
 | **Embedding** | BAAI/bge-large-zh-v1.5 | 1024 维，中文 MTEB 霸榜 |
 | **向量库** | ChromaDB | 本地持久化，零配置 |
 | **关键词检索** | BM25 (rank_bm25) | 稀疏检索，精确匹配 ID/术语 |
@@ -105,17 +105,18 @@ langgraph-agent-lab/
 │   ├── 02_stategraph_agent.py  # 练习 2：StateGraph 白盒版
 │   ├── 03_interactive_agent.py # 练习 3：交互式 + 真实 API
 │   └── 04_free_weather_agent.py# 练习 4：零配置 Skill 风格
-├── tools/                      # 工具模块
+├── core/                      # Agent 内部基础设施（非 LLM @tool）
+│   ├── context_manager.py     # ⭐ 三层上下文压缩（Claude Code 风格）
+│   ├── mcp_loader.py          # ⭐ MCP 动态加载器（持久 session + 热重载）
+│   ├── output_budget.py       # ⭐ 工具输出预算（固定上限 + 截断感知提示）
+│   └── session_memory.py      # ⭐ 会话记忆追踪（零成本，纯规则提取）
+├── tools/                     # LLM @tool（对外可调用的工具）
 │   ├── rag_tool.py             # ⭐ 企业级 RAG（混合检索 + 增量入库 + BM25 缓存）
 │   ├── weather_tool.py         # 天气查询（wttr.in，免费无 Key）
 │   ├── time_tool.py            # 当前时间查询
 │   ├── file_ops.py             # 文件读取/列表/搜索
 │   ├── file_edit.py            # 文件编辑（write_file, edit_file）
 │   ├── shell_tool.py           # Shell 命令执行（run_command）
-│   ├── context_manager.py      # ⭐ 三层上下文压缩（Claude Code 风格）
-│   ├── mcp_loader.py           # ⭐ MCP 动态加载器（持久 session + 热重载）
-│   ├── output_budget.py        # ⭐ 工具输出预算（固定上限 + 截断感知提示）
-│   ├── session_memory.py       # ⭐ 会话记忆追踪（零成本，纯规则提取）
 │   └── search/                 # 联网搜索
 │       ├── base.py             # 搜索引擎抽象基类
 │       ├── engine_factory.py   # 引擎工厂（主备降级）

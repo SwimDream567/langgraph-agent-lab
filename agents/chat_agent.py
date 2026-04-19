@@ -122,7 +122,7 @@ def _build_tools():
 
     # ★ 加载 MCP 工具（从全局单例读取，由 main() 提前加载）
     try:
-        from tools.mcp_loader import mcp_manager
+        from core.mcp_loader import mcp_manager
         mcp_tools = mcp_manager.tools
     except Exception as e:
         print(f"  {_A['d']}[MCP] 加载跳过: {e}{_A['0']}")
@@ -354,7 +354,7 @@ def _build_graph():
     planner_agent = _make_sub_agent("bind_planner", PLANNER_TOOLS, PLANNER_PROMPT)
 
     # ── 自定义 reducer：add_messages + MicroCompact + 清理孤儿 tool_calls ──
-    from tools.context_manager import micro_compact
+    from core.context_manager import micro_compact
 
     def _safe_add_messages(existing, new):
         combined = add_messages(existing, new)
@@ -657,7 +657,7 @@ async def _cmd(cmd: str, mgr: SessionManager) -> bool:
 
     # ── /mcp 命令 — MCP 服务器管理 ──
     if a == "/mcp":
-        from tools.mcp_loader import mcp_manager
+        from core.mcp_loader import mcp_manager
 
         if not arg or arg == "status":
             # /mcp 或 /mcp status — 显示状态
@@ -718,7 +718,7 @@ async def _cmd(cmd: str, mgr: SessionManager) -> bool:
     # ── /context — 查看当前上下文状态 ──
     if a == "/context":
         try:
-            from tools.context_manager import get_context_stats
+            from core.context_manager import get_context_stats
             ck = _runtime.get("ck")
             if ck is None:
                 print(f"\n  {_A['y']}上下文尚未初始化（发一条消息后可用）{_A['0']}\n")
@@ -738,7 +738,7 @@ async def _cmd(cmd: str, mgr: SessionManager) -> bool:
             print(f"  估算 token:  ~{est_tokens:,}")
             # 会话记忆统计
             try:
-                from tools.session_memory import session_memory as _sm
+                from core.session_memory import session_memory as _sm
                 ms = _sm.get_stats(tid)
                 print(f"  会话记忆:    {ms['turn_count']} 轮 | "
                       f"{ms['key_files']} 文件 | {ms['tools_used']} 工具 | "
@@ -747,7 +747,7 @@ async def _cmd(cmd: str, mgr: SessionManager) -> bool:
                 pass
             # 熔断器状态
             try:
-                from tools.context_manager import get_circuit_status
+                from core.context_manager import get_circuit_status
                 cs = get_circuit_status()
                 if cs["is_open"]:
                     print(f"  熔断器:      {_A['r']}⚠ 已断开（连续 {cs['consecutive_failures']} 次失败）{_A['0']}")
@@ -757,7 +757,7 @@ async def _cmd(cmd: str, mgr: SessionManager) -> bool:
                 pass
             # 输出预算状态
             try:
-                from tools.output_budget import get_budget_info
+                from core.output_budget import get_budget_info
                 print(f"  输出预算:    {get_budget_info()}")
             except Exception:
                 pass
@@ -818,7 +818,7 @@ async def _turn(user_input: str, thread_id: str):
     _env = ENV_BLOCK.replace("{current_time}", _now).replace("{cwd}", _cwd)
 
     # 注入会话记忆（Layer 2：零成本自动追踪）
-    from tools.session_memory import session_memory
+    from core.session_memory import session_memory
     memory_block = session_memory.get_memory_block(thread_id)
     parts = [_env]
     if memory_block:
@@ -857,7 +857,7 @@ async def _turn(user_input: str, thread_id: str):
         # ★ MCP 懒加载：首次对话时同步加载（算在 Thinking 里，静默）
         if not _runtime.get("mcp_loaded"):
             try:
-                from tools.mcp_loader import mcp_manager
+                from core.mcp_loader import mcp_manager
                 if not mcp_manager.is_active:
                     await mcp_manager.load()
                 if mcp_manager.is_active:
@@ -947,9 +947,9 @@ async def _turn(user_input: str, thread_id: str):
                             stop_spinner()
                             if tp: sys.stdout.write(_A["0"]); print()
                             rp = True
-                        # 首次正式回复写缩进，后续靠 \n 替换自动缩进
-                        if not _reply_started:
                             sys.stdout.write("    "); sys.stdout.flush()
+                        # 首次正式回复
+                        if not _reply_started:
                             _reply_started = True
                         type_text(text.replace("\n", "\n    "), 0.025)
 
@@ -1001,7 +1001,7 @@ async def _turn(user_input: str, thread_id: str):
 async def _track_memory(thread_id: str):
     """对话结束后更新会话记忆（Layer 2：零成本自动追踪）"""
     try:
-        from tools.session_memory import session_memory
+        from core.session_memory import session_memory
         cfg = {"configurable": {"thread_id": thread_id}}
         state = await _runtime["graph"].aget_state(cfg)
         msgs = state.values.get("messages", [])
@@ -1020,7 +1020,7 @@ async def _auto_compact(thread_id: str, *, force: bool = False) -> bool:
     Returns:
         True 表示执行了压缩
     """
-    from tools.context_manager import (
+    from core.context_manager import (
         get_context_stats, COMPACT_THRESHOLD,
         is_compact_circuit_open, record_compact_failure, record_compact_success,
     )
@@ -1059,7 +1059,7 @@ async def _auto_compact(thread_id: str, *, force: bool = False) -> bool:
         print(f"  {_A['y']}⏳ 上下文 ~{est_tokens:,} tokens，正在压缩...{_A['0']}")
         start_spinner("Compacting")
 
-        from tools.context_manager import summarize_and_compact
+        from core.context_manager import summarize_and_compact
         llm = _runtime.get("llm")
         if not llm:
             stop_spinner()
@@ -1092,7 +1092,7 @@ async def _auto_compact(thread_id: str, *, force: bool = False) -> bool:
 
         # Step 4: 压缩后重建 — 重新注入近期文件上下文
         try:
-            from tools.session_memory import session_memory as _sm
+            from core.session_memory import session_memory as _sm
             file_context = _sm.get_recent_file_context(thread_id)
             if file_context:
                 from langchain_core.messages import HumanMessage as _HM
@@ -1188,7 +1188,7 @@ async def main():
         await _runtime["ck_ctx"].__aexit__(None, None, None)
     # 清理 MCP 连接
     try:
-        from tools.mcp_loader import mcp_manager
+        from core.mcp_loader import mcp_manager
         await mcp_manager._close()
     except Exception:
         pass
