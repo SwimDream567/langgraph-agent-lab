@@ -258,8 +258,8 @@ MODEL_MINIMAX_BASE=https://api.minimaxi.com/v1
 MODEL_MINIMAX_ID=MiniMax-M2.7
 
 # 同供应商多模型：继承 KEY/BASE，只换 ID
-MODEL_MINIMAX_PRO_INHERIT=minimax
-MODEL_MINIMAX_PRO_ID=MiniMax-M2.7-Pro
+MODEL_MINIMAX_25_INHERIT=minimax
+MODEL_MINIMAX_25_ID=MiniMax-M2.5
 
 # 不同供应商：完整声明
 MODEL_DEEPSEEK_KEY=sk-yyy
