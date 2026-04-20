@@ -38,12 +38,12 @@ DEFAULT_TIMEOUT = 30
 
 @tool
 def run_command(command: str, cwd: str = "", timeout: int = DEFAULT_TIMEOUT) -> str:
-    """在终端执行命令并返回输出结果。
+    """Execute a command in the terminal and return the output.
 
     Args:
-        command: 要执行的命令（如 "dir", "python test.py", "git status"）
-        cwd:     工作目录（默认当前目录）
-        timeout: 超时秒数（默认 30，最大 120）
+        command: Command to execute (e.g. "dir", "python test.py", "git status")
+        cwd:     Working directory (default: current directory)
+        timeout: Timeout in seconds (default 30, max 120)
     """
     try:
         # 危险命令检测

@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 
 @tool
 def get_current_time() -> str:
-    """获取当前日期、时间和星期几（系统本地时区）"""
+    """Get current date, time, and weekday (system local timezone)"""
     from datetime import datetime
     now = datetime.now()
     try:

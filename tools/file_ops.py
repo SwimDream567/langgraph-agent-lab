@@ -41,12 +41,12 @@ def _safe_path(path: str) -> str:
 
 @tool
 def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
-    """读取指定文件的内容（只读，不会修改文件）。
+    """Read file contents (read-only, does not modify files).
 
     Args:
-        path:   文件的绝对路径或相对路径
-        offset: 从第几行开始读（默认第 1 行）
-        limit:  最多读多少行（默认 200，最大 500）
+        path:   File path (absolute or relative)
+        offset: Start line number (default 1)
+        limit:  Maximum lines to read (default 200, max 500)
     """
     try:
         p = _safe_path(path)
@@ -110,12 +110,12 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
 
 @tool
 def list_dir(path: str, pattern: str = "*", recursive: bool = False) -> str:
-    """列出指定目录下的文件和子目录（只读）。
+    """List files and subdirectories under a given directory (read-only).
 
     Args:
-        path:      目录的绝对路径或相对路径
-        pattern:   文件名匹配模式，如 '*.py'、'*.java'（默认 '*'）
-        recursive: 是否递归子目录（默认 False）
+        path:      Directory path (absolute or relative)
+        pattern:   Filename glob pattern, e.g. '*.py', '*.java' (default '*')
+        recursive: Whether to list subdirectories recursively (default False)
     """
     try:
         p = _safe_path(path)
@@ -197,11 +197,11 @@ def list_dir(path: str, pattern: str = "*", recursive: bool = False) -> str:
 
 @tool
 def search_file(path: str, pattern: str) -> str:
-    """在指定目录下递归搜索匹配文件名的文件（类似 find 命令）。
+    """Recursively search for files matching a name pattern in a directory (similar to `find` command).
 
     Args:
-        path:    搜索的起始目录
-        pattern: 文件名模式，如 '*.py'、'*test*'、'config.*'
+        path:    Search root directory
+        pattern: File name pattern, e.g. '*.py', '*test*', 'config.*'
     """
     try:
         p = _safe_path(path)
@@ -255,13 +255,13 @@ def search_file(path: str, pattern: str) -> str:
 
 @tool
 def search_content(path: str, pattern: str, file_glob: str = "*", context: int = 2) -> str:
-    """在文件内容中搜索匹配的文本（类似 grep 命令）。
+    """Search text within files in a directory (similar to `grep` command).
 
     Args:
-        path:       搜索的起始目录
-        pattern:    正则表达式或普通文本
-        file_glob:  只搜索匹配的文件类型，如 '*.py'、'*.java'（默认 '*'）
-        context:    每个匹配结果显示上下各几行（默认 2）
+        path:       Search root directory
+        pattern:    Regex or plain text to search for
+        file_glob:  Only search matching file types, e.g. '*.py', '*.java' (default '*')
+        context:    Number of context lines around each match (default 2)
     """
     try:
         p = _safe_path(path)

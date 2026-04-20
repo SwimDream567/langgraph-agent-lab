@@ -70,13 +70,11 @@ def _fetch_one(url: str) -> str:
 
 @tool
 def web_fetch(urls: list[str]) -> str:
-    """根据 URL 列表抓取网页正文内容，返回 Markdown 格式。
-
-    在 web_search 找到相关 URL 后，如果需要详细阅读页面内容（如研究报告、
-    深度文章、具体数据），再调用此工具。最多一次抓取 3 个 URL。
+    """Fetch webpage content from URLs and return as Markdown. Use after web_search finds relevant URLs.
+    Max 3 URLs per call. Each page truncated at 3000 chars.
 
     Args:
-        urls: 要抓取的 URL 列表，如 ["https://example.com", "https://foo.com"]
+        urls: List of URLs to fetch, e.g. ["https://example.com", "https://foo.com"]
     """
     if not urls:
         return "未提供 URL 列表。"

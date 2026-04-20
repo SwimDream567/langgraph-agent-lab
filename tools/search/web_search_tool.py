@@ -21,13 +21,11 @@ _factory = SearchEngineFactory()
 
 @tool
 def web_search(query: str) -> str:
-    """联网搜索，找到与关键词相关的网页 URL 和摘要。
-
-    当需要查找实时信息、最新新闻、实时数据或核实事实时调用。
-    如果需要详细阅读某个页面的完整内容，再用 web_fetch 抓取。
+    """Search the web and return relevant URLs and snippets. Use for real-time information, latest news, or fact-checking.
+    For detailed page content, use web_fetch afterwards.
 
     Args:
-        query: 搜索关键词，用简短精准的中文或英文描述
+        query: Search keywords — concise and specific description in Chinese or English
     """
     try:
         results, engine_name = _factory.search(query, max_results=5)
