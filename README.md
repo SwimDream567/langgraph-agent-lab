@@ -11,6 +11,7 @@
 - **MCP 动态加载器** — 读取 `.mcp.json`，持久 session + 热重载 + 斜杠命令管理
 - **工具输出预算** — 固定上限 + 截断感知提示，agent 主动补读
 - **流式输出 + 思考动画** — 实时流式响应，Braille 点阵思考动画
+- **Textual TUI 界面** — 弹窗选择器（ModalScreen）+ HITL 人机协同 + Tab 命令补全
 - **联网搜索** — SearXNG / DuckDuckGo，工厂模式 + 主备降级
 - **网页抓取** — URL 自动识别并抓取内容
 - **企业级 RAG** — ChromaDB + BM25 + RRF 融合检索，增量入库，支持 46 种文件格式
@@ -95,6 +96,7 @@ langgraph-agent-lab/
 │   ├── chat_agent.py           # ⭐ 核心：Supervisor + Multi-Agent（~1200 行）
 │   ├── session_manager.py      # 多会话管理（SQLite + JSON 索引）
 │   └── ui/                     # UI 模块
+│       ├── tui_app.py          # ⭐ Textual TUI 界面（弹窗选择器 + HITL + 命令补全）
 │       ├── spinner.py          # Braille 点阵思考动画
 │       ├── stream_parser.py    # 流式输出解析（think 标签过滤）
 │       ├── display.py          # 终端颜色/布局
@@ -200,15 +202,15 @@ python agents/chat_agent.py
 
 | 命令 | 说明 |
 |------|------|
-| `/sessions` | 列出所有会话 |
-| `/new` | 新建会话 |
-| `/switch <id>` | 切换到指定会话 |
-| `/rename <name>` | 重命名当前会话 |
-| `/delete` | 删除当前会话 |
-| `/models` | 列出/切换可用模型 |
+| `/sessions` `/ls` | 弹窗列出/切换会话（↑↓选择，支持 Tab 补全） |
+| `/new` [名称] | 新建并切换到新会话 |
+| `/rename` <名称> | 重命名当前会话 |
+| `/delete` | 删除指定会话 |
+| `/models` | 弹窗列出/切换可用模型 |
 | `/mcp` | 管理 MCP 服务器 |
-| `/help` | 显示帮助 |
-| `/quit` | 退出 |
+| `/context` | 查看当前上下文状态 |
+| `/compact` | 手动压缩上下文 |
+| `/quit` `/q` | 退出 |
 
 ## 🔍 核心功能
 

@@ -33,11 +33,11 @@ def _safe_path(path: str) -> str:
 
 @tool
 def write_file(path: str, content: str) -> str:
-    """创建或覆盖文件。会自动创建父目录。
+    """Create or overwrite a file. Auto-creates parent directories.
 
     Args:
-        path:    文件的绝对路径或相对路径
-        content: 要写入的完整内容
+        path:    File path (absolute or relative)
+        content: Full content to write to the file
     """
     try:
         p = _safe_path(path)
@@ -65,12 +65,12 @@ def write_file(path: str, content: str) -> str:
 
 @tool
 def edit_file(path: str, old_str: str, new_str: str) -> str:
-    """精确替换文件中的某段文本。old_str 必须在文件中唯一匹配。
+    """Precisely replace a text segment in a file. old_str must uniquely match in the file.
 
     Args:
-        path:    文件的绝对路径或相对路径
-        old_str: 要被替换的原文本（必须精确匹配，包括缩进和空行）
-        new_str: 替换后的新文本（传空字符串表示删除）
+        path:    File path (absolute or relative)
+        old_str: Original text to replace (must match exactly, including indentation and blank lines)
+        new_str: Replacement text (pass empty string to delete)
     """
     try:
         p = _safe_path(path)

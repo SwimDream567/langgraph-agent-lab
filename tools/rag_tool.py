@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-import sys; sys.stdout.reconfigure(encoding='utf-8')
+import sys
+# 安全的 UTF-8 重配置：Textual 等 TUI 框架会替换 stdout 为自定义对象（无 reconfigure）
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # RAG 日志开关：被 chat_agent.py 导入时静默，独立运行时输出
 _QUIET = not sys.argv[0].endswith("rag_tool.py")
@@ -622,7 +625,10 @@ def _hybrid_search(query: str, top_k: int = 4):
 
 @tool
 def rag_search(query: str) -> str:
-    """搜索本地知识库，查找与用户问题相关的文档内容。适用于需要参考已有资料回答问题的场景。
+    """Search local knowledge base for documents relevant to a user query. Use when answers require referencing existing knowledge.
+
+    Args:
+        query: Search query
     """
     results = _hybrid_search(query, top_k=4)
 
@@ -643,7 +649,11 @@ def rag_search(query: str) -> str:
 
 @tool
 def add_knowledge(folder_path: str) -> str:
-    """将文件夹里的文档加入知识库（强制重建索引）。文件夹路径必须是绝对路径。"""
+    """Add documents from a folder to the knowledge base (force rebuild index). Path must be absolute.
+
+    Args:
+        folder_path: Absolute path to the folder containing documents to ingest
+    """
     if not os.path.isabs(folder_path):
         return "请提供绝对路径"
     if not os.path.isdir(folder_path):
