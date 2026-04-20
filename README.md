@@ -12,6 +12,7 @@
 - **工具输出预算** — 固定上限 + 截断感知提示，agent 主动补读
 - **流式输出 + 思考动画** — 实时流式响应，Braille 点阵思考动画
 - **Textual TUI 界面** — 弹窗选择器（ModalScreen）+ HITL 人机协同 + Tab 命令补全
+- **HITL 人机协同** — AI 可暂停执行弹出选项让用户确认（ask_user / confirm / 多问题调查）
 - **联网搜索** — SearXNG / DuckDuckGo，工厂模式 + 主备降级
 - **网页抓取** — URL 自动识别并抓取内容
 - **企业级 RAG** — ChromaDB + BM25 + RRF 融合检索，增量入库，支持 46 种文件格式
@@ -86,6 +87,8 @@
 | **文件操作** | read/write/edit/search | 代码文件读写编辑 |
 | **Shell** | asyncio.create_subprocess | 命令执行，30s 超时 + 危险命令拦截 |
 | **会话持久化** | AsyncSqliteSaver | LangGraph 原生 checkpoint |
+| **TUI 框架** | Textual 8.2.3 | ModalScreen 弹窗 + OptionList 选择 + 流式 Markdown |
+| **HITL** | asyncio.Future 同步桥 | Agent 暂停等用户确认，支持选项/确认/多问题调查 |
 | **文件解析** | PyPDF2 / python-docx / python-pptx | 支持 46 种文件格式 |
 
 ## 📁 项目结构
@@ -93,15 +96,12 @@
 ```
 langgraph-agent-lab/
 ├── agents/                     # Agent 实现
-│   ├── chat_agent.py           # ⭐ 核心：Supervisor + Multi-Agent（~1200 行）
+│   ├── chat_agent.py           # ⭐ 核心：Supervisor + Multi-Agent + TUI 入口
 │   ├── session_manager.py      # 多会话管理（SQLite + JSON 索引）
 │   └── ui/                     # UI 模块
 │       ├── tui_app.py          # ⭐ Textual TUI 界面（弹窗选择器 + HITL + 命令补全）
-│       ├── spinner.py          # Braille 点阵思考动画
 │       ├── stream_parser.py    # 流式输出解析（think 标签过滤）
-│       ├── display.py          # 终端颜色/布局
-│       ├── colors.py           # ANSI 颜色常量
-│       └── layout.py           # 终端宽度检测
+│       └── colors.py           # ANSI 颜色常量
 ├── basics/                     # 学习练习（从零到一）
 │   ├── 01_weather_agent.py     # 练习 1：第一个 Agent
 │   ├── 02_stategraph_agent.py  # 练习 2：StateGraph 白盒版
@@ -114,6 +114,7 @@ langgraph-agent-lab/
 │   └── session_memory.py      # ⭐ 会话记忆追踪（零成本，纯规则提取）
 ├── tools/                     # LLM @tool（对外可调用的工具）
 │   ├── rag_tool.py             # ⭐ 企业级 RAG（混合检索 + 增量入库 + BM25 缓存）
+│   ├── hitl_tool.py            # ⭐ HITL 人机协同（ask_user / confirm / ask_questions）
 │   ├── weather_tool.py         # 天气查询（wttr.in，免费无 Key）
 │   ├── time_tool.py            # 当前时间查询
 │   ├── file_ops.py             # 文件读取/列表/搜索
